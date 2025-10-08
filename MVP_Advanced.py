@@ -342,27 +342,27 @@ if ticker:
                 st.pyplot(fig1)
 
                 # ----------------------------
-                # Plot 2: Scenario paths + last 7 days
+                # Plot 2: Scenario paths + last 7 days — FIXED
                 # ----------------------------
                 last_7_days = close_prices.iloc[-7:]
-                days = np.arange(-6, 1)  # -6, -5, ..., 0 (today)
-                forecast_days_arr = np.arange(1, forecast_days + 1)
-                all_time = np.concatenate([days, forecast_days_arr])
+                days_hist = np.arange(-6, 1)  # -6, -5, ..., 0 (today)
+                days_forecast = np.arange(1, forecast_days + 1)
 
                 fig2, ax2 = plt.subplots(figsize=(8, 4))
                 # Plot historical
-                ax2.plot(days, last_7_days.values, 'o-', color='black', label='Last 7 Days', linewidth=2, markersize=4)
+                ax2.plot(days_hist, last_7_days.values, 'o-', color='black', label='Last 7 Days', linewidth=2, markersize=4)
 
-                # Plot scenarios
-                full_path_up_5_10 = np.concatenate([last_7_days.values[-1:], path_up_5_10[1:]])
-                full_path_up_0_5 = np.concatenate([last_7_days.values[-1:], path_up_0_5[1:]])
-                full_path_down_0_5 = np.concatenate([last_7_days.values[-1:], path_down_0_5[1:]])
-                full_path_down_5_10 = np.concatenate([last_7_days.values[-1:], path_down_5_10[1:]])
+                # Ensure paths are 1D arrays
+                path_up_5_10 = np.asarray(path_up_5_10).ravel()
+                path_up_0_5 = np.asarray(path_up_0_5).ravel()
+                path_down_0_5 = np.asarray(path_down_0_5).ravel()
+                path_down_5_10 = np.asarray(path_down_5_10).ravel()
 
-                ax2.plot(forecast_days_arr, full_path_up_5_10[1:], 'o--', color='green', label='+5% to +10%', linewidth=2, markersize=4)
-                ax2.plot(forecast_days_arr, full_path_up_0_5[1:], 'o--', color='blue', label='+0% to +5%', linewidth=2, markersize=4)
-                ax2.plot(forecast_days_arr, full_path_down_0_5[1:], 'o--', color='orange', label='-5% to 0%', linewidth=2, markersize=4)
-                ax2.plot(forecast_days_arr, full_path_down_5_10[1:], 'o--', color='red', label='-10% to -5%', linewidth=2, markersize=4)
+                # Plot only the forecast part (from day 1 to forecast_days)
+                ax2.plot(days_forecast, path_up_5_10[1:], 'o--', color='green', label='+5% to +10%', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_up_0_5[1:], 'o--', color='blue', label='+0% to +5%', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_down_0_5[1:], 'o--', color='orange', label='-5% to 0%', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_down_5_10[1:], 'o--', color='red', label='-10% to -5%', linewidth=2, markersize=4)
 
                 ax2.set_xlabel('Days (0 = today)')
                 ax2.set_ylabel('Price ($)')
