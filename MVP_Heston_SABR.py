@@ -48,29 +48,58 @@ if ticker:
                 # corr(dW1, dW2) = ρ
                 # ----------------------------
                 def calibrate_heston(log_returns):
-                    # Initial guess: κ=2, θ=σ², ξ=0.3, ρ=-0.5, v0=σ²
-                    sigma2 = np.var(log_returns) * 252
-                    x0 = [2.0, sigma2, 0.3, -0.5, sigma2]
+    # Убедимся, что данные валидны
+    if len(log_returns) < 20:
+        # Возвращаем разумные дефолтные параметры
+        sigma2 = 0.04  # 20% годовой волатильности → var = 0.2^2 = 0.04
+        return np.array([2.0, sigma2, 0.3, -0.5, sigma2])
+    
+    # Очистка от NaN/inf
+    log_returns = log_returns[np.isfinite(log_returns)]
+    if len(log_returns) < 20:
+        sigma2 = 0.04
+        return np.array([2.0, sigma2, 0.3, -0.5, sigma2])
 
-                    def loss(params):
-                        kappa, theta, xi, rho, v0 = params
-                        if kappa <= 0 or theta <= 0 or xi <= 0 or v0 <= 0 or abs(rho) >= 1:
-                            return 1e6
-                        try:
-                            # Simple moment matching: match variance and kurtosis
-                            var_model = theta  # long-term variance
-                            var_hist = np.var(log_returns) * 252
-                            kurt_hist = (np.mean((log_returns - np.mean(log_returns))**4) /
-                                        (np.var(log_returns)**2)) - 3
-                            # Heston excess kurtosis ≈ 3*xi²/(kappa*theta) (approx)
-                            kurt_model = max(0, 3 * xi**2 / (kappa * theta))
-                            return (var_model - var_hist)**2 + (kurt_model - kurt_hist)**2
-                        except:
-                            return 1e6
+    try:
+        hist_var = np.var(log_returns) * 252
+        hist_var = np.clip(hist_var, 1e-4, 1.0)  # ограничим разумными пределами
+        kurt_hist = ((np.mean((log_returns - np.mean(log_returns))**4) /
+                     (np.var(log_returns)**2)) - 3) if np.var(log_returns) > 1e-8 else 0.0
+        kurt_hist = np.clip(kurt_hist, 0.0, 20.0)
+    except:
+        hist_var = 0.04
+        kurt_hist = 3.0
 
-                    res = minimize(loss, x0, method='L-BFGS-B',
-                                   bounds=[(0.1, 20), (1e-4, 1), (0.01, 2), (-0.99, 0.0), (1e-4, 1)])
-                    return res.x if res.success else x0
+    # Начальные параметры как np.array
+    x0 = np.array([2.0, hist_var, 0.3, -0.5, hist_var])
+
+    def loss(params):
+        kappa, theta, xi, rho, v0 = params
+        # Проверка границ
+        if (kappa <= 0.01 or theta <= 1e-4 or xi <= 0.01 or v0 <= 1e-4 or 
+            abs(rho) >= 0.999 or kappa > 50 or theta > 1.0 or xi > 5.0):
+            return 1e6
+        try:
+            var_model = theta
+            kurt_model = max(0.0, 3 * xi**2 / (kappa * theta + 1e-8))
+            err_var = (var_model - hist_var) ** 2
+            err_kurt = (kurt_model - kurt_hist) ** 2
+            return err_var + err_kurt
+        except:
+            return 1e6
+
+    try:
+        res = minimize(loss, x0, method='L-BFGS-B',
+                       bounds=[(0.1, 20), (1e-4, 1.0), (0.01, 2.0), (-0.99, -0.01), (1e-4, 1.0)],
+                       options={'maxiter': 100})
+        if res.success and np.all(np.isfinite(res.x)):
+            return np.array(res.x, dtype=np.float64)
+        else:
+            return x0.astype(np.float64)
+    except:
+        return x0.astype(np.float64)
+
+                    
 
                 def simulate_heston(S0, kappa, theta, xi, rho, v0, T, n_paths=20000, seed=42):
                     np.random.seed(seed)
@@ -169,3 +198,4 @@ if ticker:
 
     except Exception as e:
         st.error(f"Error: {str(e)}. Try a major ticker like AAPL, MSFT, or SPY.")
+
