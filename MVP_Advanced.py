@@ -318,7 +318,6 @@ if ticker:
                         idx = np.where(mask)[0][0]
                         return paths[idx]
                     else:
-                        # Fallback: closest path
                         distances = np.abs(final - (lower + upper) / 2)
                         idx = np.argmin(distances)
                         return paths[idx]
@@ -327,6 +326,16 @@ if ticker:
                 path_up_0_5 = find_path_in_range(all_paths, p0, p_up5)
                 path_down_0_5 = find_path_in_range(all_paths, p_down5, p0)
                 path_down_5_10 = find_path_in_range(all_paths, p_down10, p_down5)
+
+                # ----------------------------
+                # ✅ ВЫВОД ИНФОРМАЦИИ СРАЗУ ПОСЛЕ ЗАГОЛОВКА
+                # ----------------------------
+                st.subheader(f"Current price: ${current_price:.2f}")
+                st.write(f"**{forecast_days}-day outlook for {ticker} ({model_choice}):**")
+                st.write(f"- 📈 {prob_up_0_5:.0%} chance: +0% to +5%")
+                st.write(f"- 📈 {prob_up_5_10:.0%} chance: +5% to +10%")
+                st.write(f"- 📉 {down_0_10:.0%} chance: down to -10%")
+                st.write(f"- ⚠️ {prob_extreme:.0%} chance: extreme move (>±10%)")
 
                 # ----------------------------
                 # Plot 1: Distribution
@@ -349,16 +358,13 @@ if ticker:
                 days_forecast = np.arange(1, forecast_days + 1)
 
                 fig2, ax2 = plt.subplots(figsize=(8, 4))
-                # Plot historical
                 ax2.plot(days_hist, last_7_days.values, 'o-', color='black', label='Last 7 Days', linewidth=2, markersize=4)
 
-                # Ensure paths are 1D arrays
                 path_up_5_10 = np.asarray(path_up_5_10).ravel()
                 path_up_0_5 = np.asarray(path_up_0_5).ravel()
                 path_down_0_5 = np.asarray(path_down_0_5).ravel()
                 path_down_5_10 = np.asarray(path_down_5_10).ravel()
 
-                # Plot only the forecast part (from day 1 to forecast_days)
                 ax2.plot(days_forecast, path_up_5_10[1:], 'o--', color='green', label='+5% to +10%', linewidth=2, markersize=4)
                 ax2.plot(days_forecast, path_up_0_5[1:], 'o--', color='blue', label='+0% to +5%', linewidth=2, markersize=4)
                 ax2.plot(days_forecast, path_down_0_5[1:], 'o--', color='orange', label='-5% to 0%', linewidth=2, markersize=4)
@@ -371,16 +377,6 @@ if ticker:
                 ax2.legend()
                 ax2.grid(True, linestyle='--', alpha=0.5)
                 st.pyplot(fig2)
-
-                # ----------------------------
-                # Output probabilities
-                # ----------------------------
-                st.subheader(f"Current price: ${current_price:.2f}")
-                st.write(f"**{forecast_days}-day outlook for {ticker} ({model_choice}):**")
-                st.write(f"- 📈 {prob_up_0_5:.0%} chance: +0% to +5%")
-                st.write(f"- 📈 {prob_up_5_10:.0%} chance: +5% to +10%")
-                st.write(f"- 📉 {down_0_10:.0%} chance: down to -10%")
-                st.write(f"- ⚠️ {prob_extreme:.0%} chance: extreme move (>±10%)")
 
                 st.caption(f"Model: {model_desc} | Calibration: 2-year historical data | Paths: 20,000")
 
