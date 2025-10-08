@@ -111,7 +111,7 @@ if ticker:
                         v = np.maximum(v, 0.0)
                         S *= np.exp(np.sqrt(v) * sqrt_dt * Z1 - 0.5 * v * dt)
                         v += kappa * (theta - v) * dt + xi * np.sqrt(v) * sqrt_dt * Z2
-                    return S
+                    return np.maximum(S, 1e-8)
 
                 # ----------------------------
                 # SABR
@@ -126,13 +126,21 @@ if ticker:
                         if window < 5:
                             nu = 0.5
                         else:
-                            rolling_vol = np.array([np.std(log_returns[i:i+window]) for i in range(len(log_returns)-window+1)])
-                            vol_changes = np.diff(rolling_vol)
-                            if len(vol_changes) < 5 or np.std(vol_changes) == 0:
+                            rolling_vol = []
+                            for i in range(len(log_returns) - window + 1):
+                                vol = np.std(log_returns[i:i+window])
+                                if np.isfinite(vol):
+                                    rolling_vol.append(vol)
+                            if len(rolling_vol) < 5:
                                 nu = 0.5
                             else:
-                                nu = (np.std(vol_changes) * np.sqrt(252)) / (np.mean(rolling_vol) + 1e-8)
-                                nu = np.clip(nu, 0.1, 2.0)
+                                rolling_vol = np.array(rolling_vol)
+                                vol_changes = np.diff(rolling_vol)
+                                if len(vol_changes) < 5 or np.std(vol_changes) == 0:
+                                    nu = 0.5
+                                else:
+                                    nu = (np.std(vol_changes) * np.sqrt(252)) / (np.mean(rolling_vol) + 1e-8)
+                                    nu = np.clip(nu, 0.1, 2.0)
                         alpha0 = np.std(log_returns) * np.sqrt(252)
                         alpha0 = np.clip(alpha0, 0.01, 2.0)
                     return alpha0, beta, nu
@@ -158,18 +166,15 @@ if ticker:
                 # Double Exponential Jump-Diffusion (Kou, 2002)
                 # ----------------------------
                 def calibrate_kou(log_returns):
-                    # Estimate jump intensity and parameters from historical outliers
                     if len(log_returns) < 50:
                         return 0.1, 3.0, 3.0, 0.4  # λ, η1, η2, p
-                    # Assume jumps occur in worst/best 2% of returns
                     threshold = np.percentile(np.abs(log_returns), 98)
                     jump_mask = np.abs(log_returns) > threshold
                     if np.sum(jump_mask) < 5:
                         return 0.1, 3.0, 3.0, 0.4
                     jump_returns = log_returns[jump_mask]
-                    λ = len(jump_returns) / len(log_returns) * 252  # annualized intensity
+                    λ = len(jump_returns) / len(log_returns) * 252
                     λ = np.clip(λ, 0.01, 2.0)
-                    # Separate up/down jumps
                     down_jumps = -jump_returns[jump_returns < 0]
                     up_jumps = jump_returns[jump_returns > 0]
                     η1 = 1.0 / (np.mean(down_jumps) + 1e-8) if len(down_jumps) > 0 else 3.0
@@ -188,15 +193,12 @@ if ticker:
                         return np.full(n_paths, S0)
                     S = np.full(n_paths, S0, dtype=np.float64)
                     for _ in range(n_steps):
-                        # Diffusion part
                         Z = np.random.randn(n_paths)
                         S *= np.exp(-0.5 * vol**2 * dt + vol * np.sqrt(dt) * Z)
-                        # Jump part
-                        N = np.random.poisson(λ * dt, n_paths)  # number of jumps
+                        N = np.random.poisson(λ * dt, n_paths)
                         total_jump = np.zeros(n_paths)
                         for i in range(n_paths):
                             if N[i] > 0:
-                                # Each jump: with prob p — up (exp with η2), else down (exp with η1)
                                 U = np.random.rand(N[i])
                                 signs = np.where(U < p, 1, -1)
                                 magnitudes = np.where(signs > 0,
@@ -209,7 +211,6 @@ if ticker:
 
                 # ----------------------------
                 # Regime-Switching Heston
-                # Regime 0: calm, Regime 1: crisis
                 # ----------------------------
                 def simulate_regime_switching_heston(S0, T, n_paths=20000, seed=42):
                     np.random.seed(seed)
@@ -218,30 +219,23 @@ if ticker:
                     if n_steps == 0:
                         return np.full(n_paths, S0)
                     
-                    # Calibrate two regimes
-                    # Regime 0 (calm): low vol, low vol-of-vol
-                    params0 = [3.0, 0.02, 0.2, -0.3, 0.02]  # κ, θ, ξ, ρ, v0
-                    # Regime 1 (crisis): high vol, high vol-of-vol, strong leverage
-                    params1 = [1.5, 0.10, 0.6, -0.8, 0.10]
-                    
-                    # Transition matrix: P[0->1] = 0.02, P[1->0] = 0.1
+                    params0 = [3.0, 0.02, 0.2, -0.3, 0.02]  # calm
+                    params1 = [1.5, 0.10, 0.6, -0.8, 0.10]   # crisis
                     P = np.array([[0.98, 0.02],
                                   [0.10, 0.90]])
                     
                     S = np.full(n_paths, S0, dtype=np.float64)
-                    v = np.full(n_paths, params0[4], dtype=np.float64)  # start in calm
-                    regime = np.zeros(n_paths, dtype=int)  # 0 = calm
-                    
+                    v = np.full(n_paths, params0[4], dtype=np.float64)
+                    regime = np.zeros(n_paths, dtype=int)
                     sqrt_dt = np.sqrt(dt)
+                    
                     for _ in range(n_steps):
-                        # Update regime
                         rand = np.random.rand(n_paths)
                         switch_to_1 = (regime == 0) & (rand < P[0,1])
                         switch_to_0 = (regime == 1) & (rand < P[1,0])
                         regime[switch_to_1] = 1
                         regime[switch_to_0] = 0
                         
-                        # Get parameters per path
                         kappa = np.where(regime == 0, params0[0], params1[0])
                         theta = np.where(regime == 0, params0[1], params1[1])
                         xi = np.where(regime == 0, params0[2], params1[2])
@@ -252,7 +246,7 @@ if ticker:
                         v = np.maximum(v, 0.0)
                         S *= np.exp(np.sqrt(v) * sqrt_dt * Z1 - 0.5 * v * dt)
                         v += kappa * (theta - v) * dt + xi * np.sqrt(v) * sqrt_dt * Z2
-                    return S
+                    return np.maximum(S, 1e-8)
 
                 # ----------------------------
                 # Run selected model
@@ -289,17 +283,44 @@ if ticker:
                     future_prices = simulate_gbm(current_price, sigma_hist, T)
                     model_desc = "Fallback GBM"
 
-                # Compute probabilities
-                up_0_5 = np.mean((future_prices > current_price) & (future_prices <= current_price * 1.05))
-                up_5_10 = np.mean((future_prices > current_price * 1.05) & (future_prices <= current_price * 1.10))
-                down_0_4 = np.mean(future_prices < current_price * 0.96)
-                extreme = np.mean((future_prices > current_price * 1.10) | (future_prices < current_price * 0.90))
+                # 🔥 ИСПРАВЛЕНИЕ: полное покрытие всех сценариев
+                future_prices = np.array(future_prices)
+                future_prices = future_prices[np.isfinite(future_prices)]
+                if len(future_prices) == 0:
+                    st.error("Simulation produced no valid prices.")
+                    st.stop()
+
+                # Определяем границы
+                p0 = current_price
+                p_up5 = p0 * 1.05
+                p_up10 = p0 * 1.10
+                p_down4 = p0 * 0.96
+                p_down10 = p0 * 0.90
+
+                # Взаимоисключающие и исчерпывающие категории
+                prob_up_0_5 = np.mean((future_prices > p0) & (future_prices <= p_up5))
+                prob_up_5_10 = np.mean((future_prices > p_up5) & (future_prices <= p_up10))
+                prob_up_gt10 = np.mean(future_prices > p_up10)
+                prob_down_0_4 = np.mean((future_prices >= p_down4) & (future_prices < p0))
+                prob_down_4_10 = np.mean((future_prices >= p_down10) & (future_prices < p_down4))
+                prob_down_lt10 = np.mean(future_prices < p_down10)
+
+                # Проверка суммы (для отладки)
+                total = prob_up_0_5 + prob_up_5_10 + prob_up_gt10 + prob_down_0_4 + prob_down_4_10 + prob_down_lt10
+                if abs(total - 1.0) > 1e-3:
+                    st.warning(f"⚠️ Probability sum = {total:.4f} (should be 1.0)")
+
+                # Группируем для вывода, как в оригинале, но корректно
+                up_0_5 = prob_up_0_5
+                up_5_10 = prob_up_5_10
+                down_0_4 = prob_down_0_4 + prob_down_4_10  # всё падение до -10%
+                extreme = prob_up_gt10 + prob_down_lt10     # >+10% или <-10%
 
                 st.subheader(f"Current price: ${current_price:.2f}")
                 st.write(f"**{forecast_days}-day outlook for {ticker} ({model_choice}):**")
                 st.write(f"- 📈 {up_0_5:.0%} chance: +0% to +5%")
                 st.write(f"- 📈 {up_5_10:.0%} chance: +5% to +10%")
-                st.write(f"- 📉 {down_0_4:.0%} chance: down to -4%")
+                st.write(f"- 📉 {down_0_4:.0%} chance: down to -10%")
                 st.write(f"- ⚠️ {extreme:.0%} chance: extreme move (>±10%)")
 
                 # Plot
