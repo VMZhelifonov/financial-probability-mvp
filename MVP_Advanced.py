@@ -51,17 +51,19 @@ if ticker:
                 # ----------------------------
                 adf_result = adfuller(log_prices)
                 is_stationary = adf_result[1] < 0.05  # p-value < 5%
-                # Estimate linear trend over last 60 days
+
+                # Estimate linear trend safely
+                trend_annualized = 0.0
                 if len(log_prices) >= 2:
                     n_trend = min(60, len(log_prices))
                     if n_trend >= 2:
-                        x_trend = np.arange(n_trend)
-                        slope, _, _, _, _ = stats.linregress(x_trend, log_prices[-n_trend:])
-                        trend_annualized = slope * 252
-                    else:
-                        trend_annualized = 0.0
-                else:
-                    trend_annualized = 0.0
+                        try:
+                            x_trend = np.arange(n_trend)
+                            slope, _, _, _, _ = stats.linregress(x_trend, log_prices[-n_trend:])
+                            if np.isfinite(slope):
+                                trend_annualized = slope * 252
+                        except Exception:
+                            trend_annualized = 0.0
 
                 st.caption(f"📊 ADF p-value: {adf_result[1]:.3f} → {'Stationary' if is_stationary else 'Non-stationary (trend present)'}")
                 st.caption(f"📈 Estimated annualized trend: {trend_annualized:.2%}")
@@ -83,7 +85,7 @@ if ticker:
                     return S
 
                 # ----------------------------
-                # Improved Heston Calibration (variance + autocorr of squared returns)
+                # Heston Calibration (variance + autocorr of squared returns)
                 # ----------------------------
                 def calibrate_heston(log_returns):
                     if len(log_returns) < 50:
@@ -96,14 +98,15 @@ if ticker:
                     hist_var = daily_var * 252
                     hist_var = np.clip(hist_var, 1e-4, 1.0)
                     
-                    # Autocorrelation of squared returns at lag 1
                     squared = log_returns**2
+                    autocorr = 0.0
                     if len(squared) > 2:
-                        autocorr = np.corrcoef(squared[:-1], squared[1:])[0,1]
-                        if not np.isfinite(autocorr):
+                        try:
+                            autocorr = np.corrcoef(squared[:-1], squared[1:])[0,1]
+                            if not np.isfinite(autocorr):
+                                autocorr = 0.0
+                        except:
                             autocorr = 0.0
-                    else:
-                        autocorr = 0.0
                     autocorr = np.clip(autocorr, 0.0, 0.9)
                     
                     x0 = np.array([2.0, hist_var, 0.3, -0.5, hist_var], dtype=np.float64)
@@ -113,11 +116,10 @@ if ticker:
                         if not (0.1 <= kappa <= 20 and 1e-4 <= theta <= 1.0 and 0.01 <= xi <= 2.0 and -0.99 <= rho <= 0.0 and 1e-4 <= v0 <= 1.0):
                             return 1e6
                         try:
-                            # Theoretical autocorrelation of variance process
                             theoretical_ac = np.exp(-kappa / 252)
                             var_error = (theta - hist_var)**2
                             ac_error = (theoretical_ac - autocorr)**2
-                            return var_error + 10 * ac_error  # weight autocorr more
+                            return var_error + 10 * ac_error
                         except:
                             return 1e6
                     
@@ -133,7 +135,7 @@ if ticker:
                         return x0
 
                 # ----------------------------
-                # Heston with Full Truncation Scheme
+                # Heston with Full Truncation
                 # ----------------------------
                 def simulate_heston_paths(S0, kappa, theta, xi, rho, v0, T, n_paths=20000, n_steps=None, seed=None):
                     if n_steps is None:
@@ -156,12 +158,81 @@ if ticker:
                     return np.maximum(S, 1e-8)
 
                 # ----------------------------
-                # SABR (unchanged for brevity)
-                # ... [оставим как есть, но можно улучшить позже]
+                # SABR Calibration and Simulation
                 # ----------------------------
+                def calibrate_sabr(log_returns, current_price):
+                    beta = 0.5
+                    if len(log_returns) < 20:
+                        nu = 0.5
+                        alpha0 = 0.2
+                    else:
+                        window = min(10, len(log_returns) // 2)
+                        if window < 5:
+                            nu = 0.5
+                        else:
+                            rolling_vol = []
+                            for i in range(len(log_returns) - window + 1):
+                                vol = np.std(log_returns[i:i+window])
+                                if np.isfinite(vol) and vol > 0:
+                                    rolling_vol.append(vol)
+                            if len(rolling_vol) < 5:
+                                nu = 0.5
+                            else:
+                                rolling_vol = np.array(rolling_vol)
+                                vol_changes = np.diff(rolling_vol)
+                                if len(vol_changes) < 2 or np.std(vol_changes) == 0:
+                                    nu = 0.5
+                                else:
+                                    nu = (np.std(vol_changes) * np.sqrt(252)) / (np.mean(rolling_vol) + 1e-8)
+                                    nu = np.clip(nu, 0.1, 2.0)
+                        alpha0 = np.std(log_returns) * np.sqrt(252)
+                        alpha0 = np.clip(alpha0, 0.01, 2.0)
+                    return alpha0, beta, nu
+
+                def simulate_sabr_paths(F0, alpha0, beta, nu, T, n_paths=20000, n_steps=None, seed=None):
+                    if n_steps is None:
+                        n_steps = int(T * 252)
+                    if seed is not None:
+                        np.random.seed(seed)
+                    dt = 1/252
+                    if n_steps == 0:
+                        return np.full((n_paths, 1), F0)
+                    F = np.full((n_paths, n_steps+1), F0, dtype=np.float64)
+                    alpha = np.full(n_paths, alpha0, dtype=np.float64)
+                    sqrt_dt = np.sqrt(dt)
+                    for t in range(1, n_steps+1):
+                        Z1 = np.random.randn(n_paths)
+                        Z2 = np.random.randn(n_paths)
+                        F[:, t] = F[:, t-1] + alpha * (np.maximum(F[:, t-1], 1e-8) ** beta) * sqrt_dt * Z1
+                        alpha *= np.exp(-0.5 * nu**2 * dt + nu * sqrt_dt * Z2)
+                        F[:, t] = np.maximum(F[:, t], 1e-8)
+                    return F
 
                 # ----------------------------
-                # Double Exp Jump-Diffusion with drift
+                # Kou Jump-Diffusion Calibration
+                # ----------------------------
+                def calibrate_kou(log_returns):
+                    if len(log_returns) < 50:
+                        return 0.1, 3.0, 3.0, 0.4
+                    threshold = np.percentile(np.abs(log_returns), 98)
+                    jump_mask = np.abs(log_returns) > threshold
+                    if np.sum(jump_mask) < 5:
+                        return 0.1, 3.0, 3.0, 0.4
+                    jump_returns = log_returns[jump_mask]
+                    λ = len(jump_returns) / len(log_returns) * 252
+                    λ = np.clip(λ, 0.01, 2.0)
+                    down_jumps = -jump_returns[jump_returns < 0]
+                    up_jumps = jump_returns[jump_returns > 0]
+                    η1 = 1.0 / (np.mean(down_jumps) + 1e-8) if len(down_jumps) > 0 else 3.0
+                    η2 = 1.0 / (np.mean(up_jumps) + 1e-8) if len(up_jumps) > 0 else 3.0
+                    η1 = np.clip(η1, 1.0, 10.0)
+                    η2 = np.clip(η2, 1.0, 10.0)
+                    p = len(up_jumps) / (len(jump_returns) + 1e-8) if len(jump_returns) > 0 else 0.4
+                    p = np.clip(p, 0.1, 0.9)
+                    return λ, η1, η2, p
+
+                # ----------------------------
+                # Kou Jump-Diffusion with drift
                 # ----------------------------
                 def simulate_kou_paths(S0, mu, vol, λ, η1, η2, p, T, n_paths=20000, n_steps=None, seed=None):
                     if n_steps is None:
@@ -239,6 +310,11 @@ if ticker:
                     all_paths = simulate_heston_paths(current_price, kappa, theta, xi, rho, v0, T, n_paths=20000, n_steps=n_steps, seed=use_seed)
                     model_desc = f"Heston (κ={kappa:.2f}, θ={theta:.4f}, ξ={xi:.2f}, ρ={rho:.2f})"
 
+                elif model_choice == "SABR":
+                    alpha0, beta, nu = calibrate_sabr(log_returns, current_price)
+                    all_paths = simulate_sabr_paths(current_price, alpha0, beta, nu, T, n_paths=20000, n_steps=n_steps, seed=use_seed)
+                    model_desc = f"SABR (α₀={alpha0:.3f}, β={beta:.1f}, ν={nu:.2f})"
+
                 elif model_choice == "GBM (Baseline)":
                     all_paths = simulate_gbm_paths(current_price, mu_hist, sigma_hist, T, n_paths=20000, n_steps=n_steps, seed=use_seed)
                     model_desc = f"GBM (μ={mu_hist:.2%}, σ={sigma_hist:.2%})"
@@ -252,10 +328,9 @@ if ticker:
                     all_paths = simulate_regime_switching_heston_paths(current_price, T, n_paths=20000, n_steps=n_steps, seed=use_seed)
                     model_desc = "Regime-Switching Heston (Calm ↔ Crisis)"
 
-                else:  # SABR or fallback
-                    alpha0, beta, nu = calibrate_sabr(log_returns, current_price)
-                    all_paths = simulate_sabr_paths(current_price, alpha0, beta, nu, T, n_paths=20000, n_steps=n_steps, seed=use_seed)
-                    model_desc = f"SABR (α₀={alpha0:.3f}, β={beta:.1f}, ν={nu:.2f})"
+                else:
+                    all_paths = simulate_gbm_paths(current_price, mu_hist, sigma_hist, T, n_paths=20000, n_steps=n_steps, seed=use_seed)
+                    model_desc = "Fallback GBM"
 
                 future_prices = all_paths[:, -1]
                 future_prices = future_prices[np.isfinite(future_prices)]
@@ -264,7 +339,7 @@ if ticker:
                     st.stop()
 
                 # ----------------------------
-                # Dynamic thresholds based on volatility
+                # Dynamic thresholds based on volatility (2σ)
                 # ----------------------------
                 vol_forecast = sigma_hist * np.sqrt(T)
                 p_up2σ = current_price * np.exp(2 * vol_forecast)
@@ -281,19 +356,21 @@ if ticker:
                 # ----------------------------
                 # Model Validation: Q-Q Plot & KS Test
                 # ----------------------------
-                # Compare empirical vs model quantiles
                 empirical_quantiles = np.quantile(log_returns, [0.1, 0.25, 0.5, 0.75, 0.9])
                 simulated_returns = np.log(all_paths[:, -1] / all_paths[:, 0])
                 model_quantiles = np.quantile(simulated_returns, [0.1, 0.25, 0.5, 0.75, 0.9])
 
-                # Kolmogorov-Smirnov test (on standardized returns)
+                ks_ok = False
+                ks_p = 0.0
                 try:
-                    ks_stat, ks_p = stats.kstest(
-                        (log_returns - np.mean(log_returns)) / (np.std(log_returns) + 1e-8),
-                        (simulated_returns - np.mean(simulated_returns)) / (np.std(simulated_returns) + 1e-8)
-                    )
-                    ks_ok = ks_p > 0.05
-                except:
+                    emp_std = np.std(log_returns)
+                    sim_std = np.std(simulated_returns)
+                    if emp_std > 1e-8 and sim_std > 1e-8:
+                        emp_norm = (log_returns - np.mean(log_returns)) / emp_std
+                        sim_norm = (simulated_returns - np.mean(simulated_returns)) / sim_std
+                        ks_stat, ks_p = stats.kstest(emp_norm, lambda x: stats.norm.cdf(x))
+                        ks_ok = ks_p > 0.05
+                except Exception:
                     ks_ok = False
                     ks_p = 0.0
 
@@ -302,35 +379,38 @@ if ticker:
                 # ----------------------------
                 st.subheader(f"Current price: ${current_price:.2f}")
                 st.write(f"**{forecast_days}-day outlook for {ticker} ({model_choice}):**")
-                st.write(f"- 📈 {prob_up_0_1σ:.0%} chance: +0σ to +1σ ({current_price:.2f} → {p_up1σ:.2f})")
+                st.write(f"- 📈 {prob_up_0_1σ:.0%} chance: +0σ to +1σ (${current_price:.2f} → ${p_up1σ:.2f})")
                 st.write(f"- 📈 {prob_up_1σ_2σ:.0%} chance: +1σ to +2σ")
                 st.write(f"- 📉 {prob_down_0_1σ + prob_down_1σ_2σ:.0%} chance: down to -2σ")
                 st.write(f"- ⚠️ {prob_extreme:.0%} chance: extreme move (>±2σ)")
 
                 if not ks_ok:
-                    st.warning(f"⚠️ Model may not fit well (KS test p={ks_p:.3f} < 0.05)")
+                    st.warning(f"⚠️ Model fit may be poor (KS test p={ks_p:.3f} < 0.05)")
 
                 # Plot 1: Distribution
                 fig1, ax1 = plt.subplots(figsize=(8, 3))
-                ax1.hist(future_prices, bins=100, density=True, alpha=0.7, color='steelblue')
-                ax1.axvline(current_price, color='red', linestyle='--', label='Current')
-                ax1.set_title('Forecast Distribution')
+                ax1.hist(future_prices, bins=100, density=True, alpha=0.7, color='steelblue', edgecolor='none')
+                ax1.axvline(current_price, color='red', linestyle='--', linewidth=2, label='Current Price')
+                ax1.set_xlabel('Future Price ($)')
+                ax1.set_ylabel('Density')
+                ax1.set_title(f'{model_choice} Forecast Distribution')
                 ax1.legend()
+                ax1.grid(True, linestyle='--', alpha=0.5)
                 st.pyplot(fig1)
 
-                # Plot 2: Q-Q Plot (Validation)
+                # Plot 2: Q-Q Plot
                 fig2, ax2 = plt.subplots(figsize=(5, 5))
-                ax2.scatter(empirical_quantiles, model_quantiles, c='red')
-                min_q = min(empirical_quantiles.min(), model_quantiles.min())
-                max_q = max(empirical_quantiles.max(), model_quantiles.max())
-                ax2.plot([min_q, max_q], [min_q, max_q], 'k--')
+                ax2.scatter(empirical_quantiles, model_quantiles, c='red', s=50)
+                lims = [min(empirical_quantiles.min(), model_quantiles.min()),
+                        max(empirical_quantiles.max(), model_quantiles.max())]
+                ax2.plot(lims, lims, 'k--', alpha=0.75, linewidth=1)
                 ax2.set_xlabel('Empirical Quantiles (log-returns)')
                 ax2.set_ylabel('Model Quantiles')
                 ax2.set_title('Q-Q Plot: Model vs Historical')
+                ax2.grid(True, linestyle='--', alpha=0.5)
                 st.pyplot(fig2)
 
                 st.caption(f"Model: {model_desc} | Seed: {'random' if use_seed is None else use_seed} | KS p-value: {ks_p:.3f}")
 
     except Exception as e:
         st.error(f"Error: {str(e)}. Try a major ticker like AAPL, MSFT, or SPY.")
-
