@@ -3,7 +3,6 @@ import yfinance as yf
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
-from scipy.stats import norm
 
 st.set_page_config(page_title="Advanced Stochastic Stock Forecaster", layout="centered")
 st.title("📈 Advanced Stochastic Stock Forecaster")
@@ -18,7 +17,7 @@ model_choice = st.selectbox("Stochastic model", ["Heston", "SABR", "GBM (Baselin
 
 if ticker:
     try:
-        data = yf.download(ticker, period="2y", progress=False)  # больше данных для калибровки
+        data = yf.download(ticker, period="2y", progress=False)
         if data.empty:
             st.error("No data found. Try a liquid ticker (e.g. AAPL, SPY).")
         else:
@@ -27,8 +26,14 @@ if ticker:
                 st.error("Not enough data. Need ≥60 days.")
             else:
                 current_price = float(close_prices.iloc[-1])
-                log_returns = np.log(close_prices / close_prices.shift(1)).dropna()
-                sigma_hist = float(log_returns.std() * np.sqrt(252))  # annualized vol
+                # Use clean numpy array for log returns
+                log_prices = np.log(close_prices.values)
+                log_returns = np.diff(log_returns_clean := log_prices)
+                log_returns = log_returns[np.isfinite(log_returns)]
+                if len(log_returns) < 20:
+                    sigma_hist = 0.2  # fallback
+                else:
+                    sigma_hist = float(np.std(log_returns) * np.sqrt(252))
 
                 # ----------------------------
                 # 1. GBM (Baseline)
@@ -37,120 +42,117 @@ if ticker:
                     np.random.seed(seed)
                     dt = 1/252
                     steps = int(T * 252)
+                    if steps == 0:
+                        return np.full(n_paths, S0)
                     Z = np.random.randn(n_paths, steps)
                     logS = np.log(S0) + np.cumsum(-0.5 * vol**2 * dt + vol * np.sqrt(dt) * Z, axis=1)
                     return np.exp(logS[:, -1])
 
                 # ----------------------------
-                # 2. Heston Model
-                # dS/S = sqrt(v) dW1
-                # dv = κ(θ - v)dt + ξ sqrt(v) dW2
-                # corr(dW1, dW2) = ρ
+                # 2. Heston Model — robust version
                 # ----------------------------
                 def calibrate_heston(log_returns):
-           # Убедимся, что данные валидны
                     if len(log_returns) < 20:
-        # Возвращаем разумные дефолтные параметры
-                    sigma2 = 0.04  # 20% годовой волатильности → var = 0.2^2 = 0.04
-                    return np.array([2.0, sigma2, 0.3, -0.5, sigma2])
-    
-    # Очистка от NaN/inf
-    log_returns = log_returns[np.isfinite(log_returns)]
-    if len(log_returns) < 20:
-        sigma2 = 0.04
-        return np.array([2.0, sigma2, 0.3, -0.5, sigma2])
-
-    try:
-        hist_var = np.var(log_returns) * 252
-        hist_var = np.clip(hist_var, 1e-4, 1.0)  # ограничим разумными пределами
-        kurt_hist = ((np.mean((log_returns - np.mean(log_returns))**4) /
-                     (np.var(log_returns)**2)) - 3) if np.var(log_returns) > 1e-8 else 0.0
-        kurt_hist = np.clip(kurt_hist, 0.0, 20.0)
-    except:
-        hist_var = 0.04
-        kurt_hist = 3.0
-
-    # Начальные параметры как np.array
-    x0 = np.array([2.0, hist_var, 0.3, -0.5, hist_var])
-
-    def loss(params):
-        kappa, theta, xi, rho, v0 = params
-        # Проверка границ
-        if (kappa <= 0.01 or theta <= 1e-4 or xi <= 0.01 or v0 <= 1e-4 or 
-            abs(rho) >= 0.999 or kappa > 50 or theta > 1.0 or xi > 5.0):
-            return 1e6
-        try:
-            var_model = theta
-            kurt_model = max(0.0, 3 * xi**2 / (kappa * theta + 1e-8))
-            err_var = (var_model - hist_var) ** 2
-            err_kurt = (kurt_model - kurt_hist) ** 2
-            return err_var + err_kurt
-        except:
-            return 1e6
-
-    try:
-        res = minimize(loss, x0, method='L-BFGS-B',
-                       bounds=[(0.1, 20), (1e-4, 1.0), (0.01, 2.0), (-0.99, -0.01), (1e-4, 1.0)],
-                       options={'maxiter': 100})
-        if res.success and np.all(np.isfinite(res.x)):
-            return np.array(res.x, dtype=np.float64)
-        else:
-            return x0.astype(np.float64)
-    except:
-        return x0.astype(np.float64)
-
+                        return np.array([2.0, 0.04, 0.3, -0.5, 0.04])
+                    log_returns = log_returns[np.isfinite(log_returns)]
+                    if len(log_returns) < 20:
+                        return np.array([2.0, 0.04, 0.3, -0.5, 0.04])
                     
+                    try:
+                        daily_var = np.var(log_returns)
+                        if daily_var < 1e-8:
+                            hist_var = 0.04
+                        else:
+                            hist_var = daily_var * 252
+                            hist_var = np.clip(hist_var, 1e-4, 1.0)
+                        kurt_hist = ((np.mean((log_returns - np.mean(log_returns))**4) / (daily_var**2)) - 3) if daily_var > 1e-8 else 0.0
+                        kurt_hist = np.clip(kurt_hist, 0.0, 20.0)
+                    except:
+                        hist_var = 0.04
+                        kurt_hist = 3.0
+
+                    x0 = np.array([2.0, hist_var, 0.3, -0.5, hist_var], dtype=np.float64)
+
+                    def loss(params):
+                        kappa, theta, xi, rho, v0 = params
+                        if not (0.1 <= kappa <= 20 and 1e-4 <= theta <= 1.0 and 0.01 <= xi <= 2.0 and -0.99 <= rho <= -0.01 and 1e-4 <= v0 <= 1.0):
+                            return 1e6
+                        try:
+                            kurt_model = 3 * xi**2 / (kappa * theta + 1e-8)
+                            return (theta - hist_var)**2 + (kurt_model - kurt_hist)**2
+                        except:
+                            return 1e6
+
+                    try:
+                        res = minimize(loss, x0, method='L-BFGS-B',
+                                       bounds=[(0.1, 20), (1e-4, 1.0), (0.01, 2.0), (-0.99, -0.01), (1e-4, 1.0)],
+                                       options={'maxiter': 100})
+                        if res.success and np.all(np.isfinite(res.x)):
+                            return np.array(res.x, dtype=np.float64)
+                        else:
+                            return x0
+                    except:
+                        return x0
 
                 def simulate_heston(S0, kappa, theta, xi, rho, v0, T, n_paths=20000, seed=42):
                     np.random.seed(seed)
                     dt = 1/252
                     n_steps = int(T * 252)
-                    S = np.full(n_paths, S0)
-                    v = np.full(n_paths, v0)
+                    if n_steps == 0:
+                        return np.full(n_paths, S0)
+                    S = np.full(n_paths, S0, dtype=np.float64)
+                    v = np.full(n_paths, v0, dtype=np.float64)
 
+                    sqrt_dt = np.sqrt(dt)
                     for _ in range(n_steps):
                         Z1 = np.random.randn(n_paths)
                         Z2 = rho * Z1 + np.sqrt(1 - rho**2) * np.random.randn(n_paths)
-                        # Full Truncation Scheme (prevents negative variance)
-                        v = np.maximum(v, 0)
-                        S *= np.exp(np.sqrt(v) * np.sqrt(dt) * Z1 - 0.5 * v * dt)
-                        v += kappa * (theta - v) * dt + xi * np.sqrt(v) * np.sqrt(dt) * Z2
+                        # Full Truncation
+                        v = np.maximum(v, 0.0)
+                        S *= np.exp(np.sqrt(v) * sqrt_dt * Z1 - 0.5 * v * dt)
+                        v += kappa * (theta - v) * dt + xi * np.sqrt(v) * sqrt_dt * Z2
                     return S
 
                 # ----------------------------
-                # 3. SABR Model (for short-term)
-                # dF = α F^β dW1
-                # dα = ν α dW2
+                # 3. SABR Model
                 # ----------------------------
                 def calibrate_sabr(log_returns, current_price):
-                    # Calibrate ν (vol-of-vol) and β (elasticity)
-                    # Fix β = 0.5 (common for equities), calibrate ν to match historical vol change
                     beta = 0.5
-                    # Estimate vol-of-vol from rolling volatility changes
-                    window = 10
-                    rolling_vol = log_returns.rolling(window).std()
-                    vol_changes = np.diff(rolling_vol.dropna())
-                    if len(vol_changes) < 5:
+                    if len(log_returns) < 20:
                         nu = 0.5
+                        alpha0 = 0.2
                     else:
-                        nu = np.std(vol_changes) * np.sqrt(252) / (rolling_vol.mean() + 1e-8)
-                        nu = np.clip(nu, 0.1, 2.0)
-                    alpha0 = sigma_hist  # initial volatility
+                        window = min(10, len(log_returns) // 2)
+                        if window < 5:
+                            nu = 0.5
+                        else:
+                            rolling_vol = np.array([np.std(log_returns[i:i+window]) for i in range(len(log_returns)-window+1)])
+                            vol_changes = np.diff(rolling_vol)
+                            if len(vol_changes) < 5 or np.std(vol_changes) == 0:
+                                nu = 0.5
+                            else:
+                                nu = (np.std(vol_changes) * np.sqrt(252)) / (np.mean(rolling_vol) + 1e-8)
+                                nu = np.clip(nu, 0.1, 2.0)
+                        alpha0 = np.std(log_returns) * np.sqrt(252)
+                        alpha0 = np.clip(alpha0, 0.01, 2.0)
                     return alpha0, beta, nu
 
                 def simulate_sabr(F0, alpha0, beta, nu, T, n_paths=20000, seed=42):
                     np.random.seed(seed)
                     dt = 1/252
                     n_steps = int(T * 252)
-                    F = np.full(n_paths, F0)
-                    alpha = np.full(n_paths, alpha0)
+                    if n_steps == 0:
+                        return np.full(n_paths, F0)
+                    F = np.full(n_paths, F0, dtype=np.float64)
+                    alpha = np.full(n_paths, alpha0, dtype=np.float64)
 
+                    sqrt_dt = np.sqrt(dt)
                     for _ in range(n_steps):
                         Z1 = np.random.randn(n_paths)
-                        Z2 = np.random.randn(n_paths)  # assume uncorrelated for simplicity
-                        F += alpha * (F ** beta) * np.sqrt(dt) * Z1
-                        alpha *= np.exp(-0.5 * nu**2 * dt + nu * np.sqrt(dt) * Z2)
-                        F = np.maximum(F, 1e-8)  # avoid negative prices
+                        Z2 = np.random.randn(n_paths)
+                        F += alpha * (np.maximum(F, 1e-8) ** beta) * sqrt_dt * Z1
+                        alpha *= np.exp(-0.5 * nu**2 * dt + nu * sqrt_dt * Z2)
+                        F = np.maximum(F, 1e-8)
                     return F
 
                 # ----------------------------
@@ -159,7 +161,10 @@ if ticker:
                 T = forecast_days / 252.0
 
                 if model_choice == "Heston":
-                    kappa, theta, xi, rho, v0 = calibrate_heston(log_returns)
+                    params = calibrate_heston(log_returns)
+                    if not (isinstance(params, np.ndarray) and params.shape == (5,)):
+                        params = np.array([2.0, 0.04, 0.3, -0.5, 0.04])
+                    kappa, theta, xi, rho, v0 = params
                     future_prices = simulate_heston(current_price, kappa, theta, xi, rho, v0, T)
                     model_desc = f"Heston (κ={kappa:.2f}, θ={theta:.4f}, ξ={xi:.2f}, ρ={rho:.2f})"
                 elif model_choice == "SABR":
@@ -198,5 +203,3 @@ if ticker:
 
     except Exception as e:
         st.error(f"Error: {str(e)}. Try a major ticker like AAPL, MSFT, or SPY.")
-
-
