@@ -48,11 +48,11 @@ if ticker:
                 # corr(dW1, dW2) = ρ
                 # ----------------------------
                 def calibrate_heston(log_returns):
-    # Убедимся, что данные валидны
-    if len(log_returns) < 20:
+           # Убедимся, что данные валидны
+                    if len(log_returns) < 20:
         # Возвращаем разумные дефолтные параметры
-        sigma2 = 0.04  # 20% годовой волатильности → var = 0.2^2 = 0.04
-        return np.array([2.0, sigma2, 0.3, -0.5, sigma2])
+                    sigma2 = 0.04  # 20% годовой волатильности → var = 0.2^2 = 0.04
+                    return np.array([2.0, sigma2, 0.3, -0.5, sigma2])
     
     # Очистка от NaN/inf
     log_returns = log_returns[np.isfinite(log_returns)]
@@ -198,4 +198,5 @@ if ticker:
 
     except Exception as e:
         st.error(f"Error: {str(e)}. Try a major ticker like AAPL, MSFT, or SPY.")
+
 
