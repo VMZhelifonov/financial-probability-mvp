@@ -52,10 +52,16 @@ if ticker:
                 adf_result = adfuller(log_prices)
                 is_stationary = adf_result[1] < 0.05  # p-value < 5%
                 # Estimate linear trend over last 60 days
-                n_trend = min(60, len(log_prices))
-                x_trend = np.arange(n_trend)
-                slope, _, _, _, _ = stats.linregress(x_trend, log_prices[-n_trend:])
-                trend_annualized = slope * 252
+                if len(log_prices) >= 2:
+                    n_trend = min(60, len(log_prices))
+                    if n_trend >= 2:
+                        x_trend = np.arange(n_trend)
+                        slope, _, _, _, _ = stats.linregress(x_trend, log_prices[-n_trend:])
+                        trend_annualized = slope * 252
+                    else:
+                        trend_annualized = 0.0
+                else:
+                    trend_annualized = 0.0
 
                 st.caption(f"📊 ADF p-value: {adf_result[1]:.3f} → {'Stationary' if is_stationary else 'Non-stationary (trend present)'}")
                 st.caption(f"📈 Estimated annualized trend: {trend_annualized:.2%}")
@@ -327,3 +333,4 @@ if ticker:
 
     except Exception as e:
         st.error(f"Error: {str(e)}. Try a major ticker like AAPL, MSFT, or SPY.")
+
