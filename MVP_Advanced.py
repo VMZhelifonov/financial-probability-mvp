@@ -378,7 +378,7 @@ if run_button:
                         st.warning("Invalid target price. Please enter a number.")
 
                 # ----------------------------
-                # Compute base probabilities
+                # Compute base probabilities and expected return
                 # ----------------------------
                 p0 = current_price
                 p_up5 = p0 * 1.05
@@ -392,6 +392,10 @@ if run_button:
                 prob_down_5_10 = np.mean((future_prices >= p_down10) & (future_prices < p_down5))
                 prob_extreme = np.mean((future_prices > p_up10) | (future_prices < p_down10))
                 down_0_10 = prob_down_0_5 + prob_down_5_10
+
+                # Ожидаемая доходность
+                expected_price = np.mean(future_prices)
+                expected_return_pct = (expected_price / current_price - 1) * 100
 
                 # ----------------------------
                 # Find representative paths
@@ -421,6 +425,7 @@ if run_button:
                 st.write(f"- 📈 {prob_up_5_10:.0%} chance: +5% to +10%")
                 st.write(f"- 📉 {down_0_10:.0%} chance: down to -10%")
                 st.write(f"- ⚠️ {prob_extreme:.0%} chance: extreme move (>±10%)")
+                st.write(f"- 💡 **Expected return: {expected_return_pct:+.2f}%** in {forecast_days} days")
 
                 # Plot 1: Distribution
                 fig1, ax1 = plt.subplots(figsize=(8, 3.5))
@@ -470,8 +475,8 @@ if run_button:
                             "SPY", forecast_days, "GBM (Baseline)", n_paths=2000
                         )
                     if spy_paths is not None:
-                        spy_prob_up = np.mean(spy_future > spy_price)
-                        st.write(f"**SPY current: ${spy_price:.2f}** | Prob of gain in {forecast_days} days: **{spy_prob_up:.1%}**")
+                        spy_expected = (np.mean(spy_future) / spy_price - 1) * 100
+                        st.write(f"**SPY current: ${spy_price:.2f}** | Expected return: **{spy_expected:+.2f}%** in {forecast_days} days")
 
                         # Plot SPY distribution
                         fig3, ax3 = plt.subplots(figsize=(8, 3))
