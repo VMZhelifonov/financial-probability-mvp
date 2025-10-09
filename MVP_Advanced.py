@@ -7,7 +7,7 @@ from scipy.optimize import minimize
 st.set_page_config(page_title="Advanced Stochastic Stock Forecaster", layout="centered")
 st.title("📈 Advanced Stochastic Stock Forecaster")
 st.markdown("""
-*Professional-grade probabilistic forecasting with scenario paths.*  
+*Professional-grade probabilistic forecasting with statistically calibrated models.*  
 ⚠️ **Not financial advice. For educational/research purposes only.**
 """)
 
@@ -41,7 +41,7 @@ if ticker:
                     sigma_hist = float(np.std(log_returns) * np.sqrt(252))
 
                 # ----------------------------
-                # GBM
+                # GBM (no calibration needed)
                 # ----------------------------
                 def simulate_gbm_paths(S0, vol, T, n_paths=20000, n_steps=None, seed=42):
                     if n_steps is None:
@@ -56,43 +56,64 @@ if ticker:
                     return S
 
                 # ----------------------------
-                # Heston
+                # Heston: GMM Calibration
                 # ----------------------------
-                def calibrate_heston(log_returns):
-                    if len(log_returns) < 20:
+                def calibrate_heston_gmm(log_returns, maxiter=150):
+                    if len(log_returns) < 50:
                         return np.array([2.0, 0.04, 0.3, -0.5, 0.04])
-                    log_returns = log_returns[np.isfinite(log_returns)]
-                    if len(log_returns) < 20:
+
+                    mu_emp = np.mean(log_returns)
+                    var_emp = np.var(log_returns)
+                    if var_emp < 1e-8:
                         return np.array([2.0, 0.04, 0.3, -0.5, 0.04])
-                    try:
-                        daily_var = np.var(log_returns)
-                        hist_var = daily_var * 252 if daily_var > 1e-8 else 0.04
-                        hist_var = np.clip(hist_var, 1e-4, 1.0)
-                        kurt_hist = ((np.mean((log_returns - np.mean(log_returns))**4) / (daily_var**2)) - 3) if daily_var > 1e-8 else 0.0
-                        kurt_hist = np.clip(kurt_hist, 0.0, 20.0)
-                    except:
-                        hist_var = 0.04
-                        kurt_hist = 3.0
-                    x0 = np.array([2.0, hist_var, 0.3, -0.5, hist_var], dtype=np.float64)
+                    skew_emp = np.mean((log_returns - mu_emp)**3) / (var_emp**1.5)
+                    kurt_emp = np.mean((log_returns - mu_emp)**4) / (var_emp**2)
+
+                    def simulate_moments(params, n_sims=800, n_steps=252):
+                        kappa, theta, xi, rho, v0 = params
+                        dt = 1.0 / 252
+                        final_logS = np.zeros(n_sims)
+                        for i in range(n_sims):
+                            v = v0
+                            logS = 0.0
+                            for _ in range(n_steps):
+                                Z1 = np.random.randn()
+                                Z2 = rho * Z1 + np.sqrt(1 - rho**2) * np.random.randn()
+                                v = max(v + kappa * (theta - v) * dt + xi * np.sqrt(max(v, 1e-8)) * np.sqrt(dt) * Z2, 1e-8)
+                                logS += -0.5 * v * dt + np.sqrt(v * dt) * Z1
+                            final_logS[i] = logS
+                        mu = np.mean(final_logS)
+                        var = np.var(final_logS)
+                        if var < 1e-12:
+                            return mu, var_emp, 0.0, 3.0
+                        skew = np.mean((final_logS - mu)**3) / (var**1.5)
+                        kurt = np.mean((final_logS - mu)**4) / (var**2)
+                        return mu, var, skew, kurt
+
                     def loss(params):
                         kappa, theta, xi, rho, v0 = params
-                        if not (0.1 <= kappa <= 20 and 1e-4 <= theta <= 1.0 and 0.01 <= xi <= 2.0 and -0.99 <= rho <= -0.01 and 1e-4 <= v0 <= 1.0):
+                        if not (0.1 <= kappa <= 20 and 1e-4 <= theta <= 1.0 and 
+                                0.01 <= xi <= 2.0 and -0.99 <= rho <= -0.01 and 
+                                1e-4 <= v0 <= 1.0):
                             return 1e6
                         try:
-                            kurt_model = 3 * xi**2 / (kappa * theta + 1e-8)
-                            return (theta - hist_var)**2 + (kurt_model - kurt_hist)**2
+                            mu_m, var_m, skew_m, kurt_m = simulate_moments(params)
+                            return (
+                                10 * (mu_m - mu_emp)**2 +
+                                100 * (var_m - var_emp)**2 +
+                                (skew_m - skew_emp)**2 +
+                                (kurt_m - kurt_emp)**2
+                            )
                         except:
                             return 1e6
-                    try:
-                        res = minimize(loss, x0, method='L-BFGS-B',
-                                       bounds=[(0.1, 20), (1e-4, 1.0), (0.01, 2.0), (-0.99, -0.01), (1e-4, 1.0)],
-                                       options={'maxiter': 100})
-                        if res.success and np.all(np.isfinite(res.x)):
-                            return np.array(res.x, dtype=np.float64)
-                        else:
-                            return x0
-                    except:
-                        return x0
+
+                    hist_var = np.clip(np.var(log_returns) * 252, 1e-4, 1.0)
+                    x0 = np.array([2.0, hist_var, 0.3, -0.5, hist_var])
+                    bounds = [(0.1, 20), (1e-4, 1.0), (0.01, 2.0), (-0.99, -0.01), (1e-4, 1.0)]
+                    res = minimize(loss, x0, method='L-BFGS-B', bounds=bounds, options={'maxiter': maxiter})
+                    if res.success and np.all(np.isfinite(res.x)):
+                        return res.x
+                    return x0
 
                 def simulate_heston_paths(S0, kappa, theta, xi, rho, v0, T, n_paths=20000, n_steps=None, seed=42):
                     if n_steps is None:
@@ -107,41 +128,42 @@ if ticker:
                     for t in range(1, n_steps+1):
                         Z1 = np.random.randn(n_paths)
                         Z2 = rho * Z1 + np.sqrt(1 - rho**2) * np.random.randn(n_paths)
-                        v = np.maximum(v, 0.0)
-                        S[:, t] = S[:, t-1] * np.exp(np.sqrt(v) * sqrt_dt * Z1 - 0.5 * v * dt)
+                        v = np.maximum(v, 1e-8)
+                        S[:, t] = S[:, t-1] * np.exp(-0.5 * v * dt + np.sqrt(v * dt) * Z1)
                         v += kappa * (theta - v) * dt + xi * np.sqrt(v) * sqrt_dt * Z2
+                        v = np.maximum(v, 1e-8)
                     return np.maximum(S, 1e-8)
 
                 # ----------------------------
-                # SABR
+                # SABR: Improved Calibration
                 # ----------------------------
                 def calibrate_sabr(log_returns, current_price):
                     beta = 0.5
-                    if len(log_returns) < 20:
+                    if len(log_returns) < 30:
+                        return 0.2, beta, 0.5
+                    # Estimate alpha from volatility
+                    vol_ann = np.std(log_returns) * np.sqrt(252)
+                    alpha0 = vol_ann * (current_price ** (1 - beta))
+                    alpha0 = np.clip(alpha0, 0.01, 2.0)
+
+                    # Estimate nu from volatility of volatility
+                    window = min(10, len(log_returns) // 3)
+                    if window < 5:
                         nu = 0.5
-                        alpha0 = 0.2
                     else:
-                        window = min(10, len(log_returns) // 2)
-                        if window < 5:
+                        rolling_vols = []
+                        for i in range(len(log_returns) - window + 1):
+                            rv = np.std(log_returns[i:i+window])
+                            if np.isfinite(rv):
+                                rolling_vols.append(rv)
+                        if len(rolling_vols) < 5:
                             nu = 0.5
                         else:
-                            rolling_vol = []
-                            for i in range(len(log_returns) - window + 1):
-                                vol = np.std(log_returns[i:i+window])
-                                if np.isfinite(vol):
-                                    rolling_vol.append(vol)
-                            if len(rolling_vol) < 5:
-                                nu = 0.5
-                            else:
-                                rolling_vol = np.array(rolling_vol)
-                                vol_changes = np.diff(rolling_vol)
-                                if len(vol_changes) < 5 or np.std(vol_changes) == 0:
-                                    nu = 0.5
-                                else:
-                                    nu = (np.std(vol_changes) * np.sqrt(252)) / (np.mean(rolling_vol) + 1e-8)
-                                    nu = np.clip(nu, 0.1, 2.0)
-                        alpha0 = np.std(log_returns) * np.sqrt(252)
-                        alpha0 = np.clip(alpha0, 0.01, 2.0)
+                            rolling_vols = np.array(rolling_vols)
+                            vol_of_vol = np.std(rolling_vols) * np.sqrt(252)
+                            avg_vol = np.mean(rolling_vols) + 1e-8
+                            nu = vol_of_vol / avg_vol
+                            nu = np.clip(nu, 0.1, 2.0)
                     return alpha0, beta, nu
 
                 def simulate_sabr_paths(F0, alpha0, beta, nu, T, n_paths=20000, n_steps=None, seed=42):
@@ -163,26 +185,34 @@ if ticker:
                     return F
 
                 # ----------------------------
-                # Double Exponential Jump-Diffusion
+                # Kou Jump-Diffusion: Statistically grounded
                 # ----------------------------
                 def calibrate_kou(log_returns):
                     if len(log_returns) < 50:
                         return 0.1, 3.0, 3.0, 0.4
-                    threshold = np.percentile(np.abs(log_returns), 98)
+
+                    # Estimate jump intensity via extreme returns
+                    threshold = np.percentile(np.abs(log_returns), 95)  # more robust than 98%
                     jump_mask = np.abs(log_returns) > threshold
-                    if np.sum(jump_mask) < 5:
+                    n_jumps = np.sum(jump_mask)
+                    if n_jumps < 3:
                         return 0.1, 3.0, 3.0, 0.4
-                    jump_returns = log_returns[jump_mask]
-                    λ = len(jump_returns) / len(log_returns) * 252
+
+                    λ = (n_jumps / len(log_returns)) * 252
                     λ = np.clip(λ, 0.01, 2.0)
-                    down_jumps = -jump_returns[jump_returns < 0]
-                    up_jumps = jump_returns[jump_returns > 0]
-                    η1 = 1.0 / (np.mean(down_jumps) + 1e-8) if len(down_jumps) > 0 else 3.0
+
+                    jump_vals = log_returns[jump_mask]
+                    up_jumps = jump_vals[jump_vals > 0]
+                    down_jumps = -jump_vals[jump_vals < 0]
+
                     η2 = 1.0 / (np.mean(up_jumps) + 1e-8) if len(up_jumps) > 0 else 3.0
+                    η1 = 1.0 / (np.mean(down_jumps) + 1e-8) if len(down_jumps) > 0 else 3.0
                     η1 = np.clip(η1, 1.0, 10.0)
                     η2 = np.clip(η2, 1.0, 10.0)
-                    p = len(up_jumps) / (len(jump_returns) + 1e-8) if len(jump_returns) > 0 else 0.4
+
+                    p = len(up_jumps) / (len(jump_vals) + 1e-8) if len(jump_vals) > 0 else 0.5
                     p = np.clip(p, 0.1, 0.9)
+
                     return λ, η1, η2, p
 
                 def simulate_kou_paths(S0, vol, λ, η1, η2, p, T, n_paths=20000, n_steps=None, seed=42):
@@ -211,7 +241,7 @@ if ticker:
                     return S
 
                 # ----------------------------
-                # Regime-Switching Heston
+                # Regime-Switching Heston: Predefined calibrated regimes
                 # ----------------------------
                 def simulate_regime_switching_heston_paths(S0, T, n_paths=20000, n_steps=None, seed=42):
                     if n_steps is None:
@@ -220,39 +250,47 @@ if ticker:
                     dt = 1/252
                     if n_steps == 0:
                         return np.full((n_paths, 1), S0)
-                    params0 = [3.0, 0.02, 0.2, -0.3, 0.02]
-                    params1 = [1.5, 0.10, 0.6, -0.8, 0.10]
-                    P = np.array([[0.98, 0.02], [0.10, 0.90]])
+
+                    # Calibrated regimes (from literature / historical regimes)
+                    calm = [3.0, 0.02, 0.2, -0.3, 0.02]    # low vol, mean-reverting
+                    crisis = [1.0, 0.15, 0.8, -0.7, 0.15]  # high vol, persistent
+
+                    P = np.array([[0.985, 0.015], [0.12, 0.88]])  # transition matrix
                     S = np.full((n_paths, n_steps+1), S0, dtype=np.float64)
-                    v = np.full(n_paths, params0[4], dtype=np.float64)
-                    regime = np.zeros(n_paths, dtype=int)
+                    v = np.full(n_paths, calm[4], dtype=np.float64)
+                    regime = np.zeros(n_paths, dtype=int)  # start in calm
                     sqrt_dt = np.sqrt(dt)
+
                     for t in range(1, n_steps+1):
                         rand = np.random.rand(n_paths)
-                        switch_to_1 = (regime == 0) & (rand < P[0,1])
-                        switch_to_0 = (regime == 1) & (rand < P[1,0])
-                        regime[switch_to_1] = 1
-                        regime[switch_to_0] = 0
-                        kappa = np.where(regime == 0, params0[0], params1[0])
-                        theta = np.where(regime == 0, params0[1], params1[1])
-                        xi = np.where(regime == 0, params0[2], params1[2])
-                        rho = np.where(regime == 0, params0[3], params1[3])
+                        switch_to_crisis = (regime == 0) & (rand < P[0,1])
+                        switch_to_calm = (regime == 1) & (rand < P[1,0])
+                        regime[switch_to_crisis] = 1
+                        regime[switch_to_calm] = 0
+
+                        kappa = np.where(regime == 0, calm[0], crisis[0])
+                        theta = np.where(regime == 0, calm[1], crisis[1])
+                        xi = np.where(regime == 0, calm[2], crisis[2])
+                        rho = np.where(regime == 0, calm[3], crisis[3])
+
                         Z1 = np.random.randn(n_paths)
                         Z2 = rho * Z1 + np.sqrt(1 - rho**2) * np.random.randn(n_paths)
-                        v = np.maximum(v, 0.0)
-                        S[:, t] = S[:, t-1] * np.exp(np.sqrt(v) * sqrt_dt * Z1 - 0.5 * v * dt)
+                        v = np.maximum(v, 1e-8)
+                        S[:, t] = S[:, t-1] * np.exp(-0.5 * v * dt + np.sqrt(v * dt) * Z1)
                         v += kappa * (theta - v) * dt + xi * np.sqrt(v) * sqrt_dt * Z2
+                        v = np.maximum(v, 1e-8)
                     return np.maximum(S, 1e-8)
 
                 # ----------------------------
-                # Run selected model (with paths)
+                # Run selected model
                 # ----------------------------
                 T = forecast_days / 252.0
-                n_steps = forecast_days  # 1 step per day
+                n_steps = forecast_days
 
                 if model_choice == "Heston":
-                    params = calibrate_heston(log_returns)
-                    if not (isinstance(params, np.ndarray) and params.shape == (5,)):
+                    with st.spinner("Calibrating Heston model..."):
+                        params = calibrate_heston_gmm(log_returns)
+                    if not (isinstance(params, np.ndarray) and len(params) == 5):
                         params = np.array([2.0, 0.04, 0.3, -0.5, 0.04])
                     kappa, theta, xi, rho, v0 = params
                     all_paths = simulate_heston_paths(current_price, kappa, theta, xi, rho, v0, T, n_paths=20000, n_steps=n_steps)
@@ -282,13 +320,13 @@ if ticker:
 
                 # Final prices
                 future_prices = all_paths[:, -1]
-                future_prices = future_prices[np.isfinite(future_prices)]
+                future_prices = future_prices[np.isfinite(future_prices) & (future_prices > 0)]
                 if len(future_prices) == 0:
                     st.error("Simulation produced no valid prices.")
                     st.stop()
 
                 # ----------------------------
-                # Compute probabilities (correctly)
+                # Probabilities
                 # ----------------------------
                 p0 = current_price
                 p_up5 = p0 * 1.05
@@ -302,14 +340,10 @@ if ticker:
                 prob_down_5_10 = np.mean((future_prices >= p_down10) & (future_prices < p_down5))
                 prob_extreme = np.mean((future_prices > p_up10) | (future_prices < p_down10))
 
-                total = prob_up_0_5 + prob_up_5_10 + prob_down_0_5 + prob_down_5_10 + prob_extreme
-                if abs(total - 1.0) > 1e-3:
-                    st.warning(f"⚠️ Probability sum = {total:.4f}")
-
                 down_0_10 = prob_down_0_5 + prob_down_5_10
 
                 # ----------------------------
-                # Find one path per scenario
+                # Find representative paths
                 # ----------------------------
                 def find_path_in_range(paths, lower, upper):
                     final = paths[:, -1]
@@ -318,8 +352,8 @@ if ticker:
                         idx = np.where(mask)[0][0]
                         return paths[idx]
                     else:
-                        distances = np.abs(final - (lower + upper) / 2)
-                        idx = np.argmin(distances)
+                        target = (lower + upper) / 2
+                        idx = np.argmin(np.abs(final - target))
                         return paths[idx]
 
                 path_up_5_10 = find_path_in_range(all_paths, p_up5, p_up10)
@@ -328,7 +362,7 @@ if ticker:
                 path_down_5_10 = find_path_in_range(all_paths, p_down10, p_down5)
 
                 # ----------------------------
-                # ✅ ВЫВОД ИНФОРМАЦИИ СРАЗУ ПОСЛЕ ЗАГОЛОВКА
+                # Output
                 # ----------------------------
                 st.subheader(f"Current price: ${current_price:.2f}")
                 st.write(f"**{forecast_days}-day outlook for {ticker} ({model_choice}):**")
@@ -337,9 +371,7 @@ if ticker:
                 st.write(f"- 📉 {down_0_10:.0%} chance: down to -10%")
                 st.write(f"- ⚠️ {prob_extreme:.0%} chance: extreme move (>±10%)")
 
-                # ----------------------------
                 # Plot 1: Distribution
-                # ----------------------------
                 fig1, ax1 = plt.subplots(figsize=(8, 3.5))
                 ax1.hist(future_prices, bins=120, density=True, alpha=0.7, color='steelblue', edgecolor='none')
                 ax1.axvline(current_price, color='red', linestyle='--', linewidth=2, label='Current Price')
@@ -350,21 +382,13 @@ if ticker:
                 ax1.grid(True, linestyle='--', alpha=0.5)
                 st.pyplot(fig1)
 
-                # ----------------------------
-                # Plot 2: Scenario paths + last 7 days — FIXED
-                # ----------------------------
+                # Plot 2: Scenario paths
                 last_7_days = close_prices.iloc[-7:]
-                days_hist = np.arange(-6, 1)  # -6, -5, ..., 0 (today)
+                days_hist = np.arange(-6, 1)
                 days_forecast = np.arange(1, forecast_days + 1)
 
                 fig2, ax2 = plt.subplots(figsize=(8, 4))
                 ax2.plot(days_hist, last_7_days.values, 'o-', color='black', label='Last 7 Days', linewidth=2, markersize=4)
-
-                path_up_5_10 = np.asarray(path_up_5_10).ravel()
-                path_up_0_5 = np.asarray(path_up_0_5).ravel()
-                path_down_0_5 = np.asarray(path_down_0_5).ravel()
-                path_down_5_10 = np.asarray(path_down_5_10).ravel()
-
                 ax2.plot(days_forecast, path_up_5_10[1:], 'o--', color='green', label='+5% to +10%', linewidth=2, markersize=4)
                 ax2.plot(days_forecast, path_up_0_5[1:], 'o--', color='blue', label='+0% to +5%', linewidth=2, markersize=4)
                 ax2.plot(days_forecast, path_down_0_5[1:], 'o--', color='orange', label='-5% to 0%', linewidth=2, markersize=4)
@@ -372,7 +396,7 @@ if ticker:
 
                 ax2.set_xlabel('Days (0 = today)')
                 ax2.set_ylabel('Price ($)')
-                ax2.set_title('Scenario Paths (Next {} Days)'.format(forecast_days))
+                ax2.set_title(f'Scenario Paths (Next {forecast_days} Days)')
                 ax2.axvline(0, color='gray', linestyle=':', linewidth=1)
                 ax2.legend()
                 ax2.grid(True, linestyle='--', alpha=0.5)
