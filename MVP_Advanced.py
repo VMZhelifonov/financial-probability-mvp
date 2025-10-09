@@ -278,7 +278,7 @@ if ticker:
                     return np.maximum(S, 1e-8)
 
                 # ----------------------------
-                # Run model
+                # Run model for forecast
                 # ----------------------------
                 T = forecast_days / 252.0
                 n_steps = forecast_days
@@ -315,22 +315,36 @@ if ticker:
                     model_desc = "Fallback GBM"
 
                 # ----------------------------
-                # Extract 1-day simulated returns for validation (SAFE VERSION)
+                # Generate 1-day simulated returns FOR VALIDATION (separate simulation)
                 # ----------------------------
-                simulated_prices_1d = all_paths[:, 1]  # price after 1 day
-                simulated_log_returns = np.log(simulated_prices_1d / current_price)
-                simulated_log_returns = simulated_log_returns[np.isfinite(simulated_log_returns) & (np.abs(simulated_log_returns) > 1e-12)]
+                empirical_log_returns = log_returns[np.isfinite(log_returns)]
+                simulated_log_returns = None
 
-                empirical_log_returns = log_returns[np.isfinite(log_returns) & (np.abs(log_returns) > 1e-12)]
+                # Only proceed if we have enough empirical data
+                if len(empirical_log_returns) >= 20:
+                    n_val_paths = 10000
+                    try:
+                        if model_choice == "Heston":
+                            val_paths = simulate_heston_paths(current_price, kappa, theta, xi, rho, v0, T=1/252, n_paths=n_val_paths, n_steps=1, seed=999)
+                        elif model_choice == "SABR":
+                            val_paths = simulate_sabr_paths(current_price, alpha0, beta, nu, T=1/252, n_paths=n_val_paths, n_steps=1, seed=999)
+                        elif model_choice == "GBM (Baseline)":
+                            val_paths = simulate_gbm_paths(current_price, sigma_hist, T=1/252, n_paths=n_val_paths, n_steps=1, seed=999)
+                        elif model_choice == "Double Exp Jump-Diffusion":
+                            val_paths = simulate_kou_paths(current_price, sigma_hist, λ, η1, η2, p, T=1/252, n_paths=n_val_paths, n_steps=1, seed=999)
+                        elif model_choice == "Regime-Switching Heston":
+                            val_paths = simulate_regime_switching_heston_paths(current_price, T=1/252, n_paths=n_val_paths, n_steps=1, seed=999)
+                        else:
+                            val_paths = simulate_gbm_paths(current_price, sigma_hist, T=1/252, n_paths=n_val_paths, n_steps=1, seed=999)
 
-                qq_available = True
-                if len(simulated_log_returns) < 10 or len(empirical_log_returns) < 10:
-                    qq_available = False
-                else:
-                    n_compare = min(len(empirical_log_returns), len(simulated_log_returns), 5000)
-                    # Random subsample for speed and fairness
-                    emp_sample = np.random.choice(empirical_log_returns, size=n_compare, replace=False)
-                    sim_sample = np.random.choice(simulated_log_returns, size=n_compare, replace=False)
+                        simulated_prices_1d = val_paths[:, 1]
+                        simulated_log_returns = np.log(simulated_prices_1d / current_price)
+                        simulated_log_returns = simulated_log_returns[np.isfinite(simulated_log_returns)]
+                    except Exception as e:
+                        st.warning(f"Validation simulation failed: {e}")
+                        simulated_log_returns = None
+
+                qq_available = (simulated_log_returns is not None) and (len(simulated_log_returns) >= 100) and (len(empirical_log_returns) >= 100)
 
                 # ----------------------------
                 # Probabilities
@@ -395,12 +409,14 @@ if ticker:
                 plt.close(fig1)
 
                 # ----------------------------
-                # Plot 2: Q-Q Plot (if available)
+                # Plot 2: Q-Q Plot and KS Test
                 # ----------------------------
                 if qq_available:
                     fig2, ax2 = plt.subplots(figsize=(6, 6))
-                    emp_sorted = np.sort(emp_sample)
-                    sim_sorted = np.sort(sim_sample)
+                    # Use all empirical and simulated returns (no subsampling needed now)
+                    emp_sorted = np.sort(empirical_log_returns)
+                    sim_sorted = np.sort(simulated_log_returns[:len(empirical_log_returns)])  # match length
+
                     ax2.scatter(emp_sorted, sim_sorted, alpha=0.6, s=10, color='steelblue')
                     min_val = min(emp_sorted.min(), sim_sorted.min())
                     max_val = max(emp_sorted.max(), sim_sorted.max())
@@ -412,11 +428,9 @@ if ticker:
                     st.pyplot(fig2)
                     plt.close(fig2)
 
-                    # ----------------------------
                     # KS Test
-                    # ----------------------------
                     try:
-                        ks_stat, p_value = stats.ks_2samp(emp_sample, sim_sample)
+                        ks_stat, p_value = stats.ks_2samp(empirical_log_returns, simulated_log_returns[:len(empirical_log_returns)])
                         st.markdown(f"**Kolmogorov-Smirnov Test (Empirical vs Model):**")
                         st.write(f"- KS Statistic: {ks_stat:.4f}")
                         st.write(f"- p-value: {p_value:.4f}")
@@ -427,7 +441,7 @@ if ticker:
                     except Exception as e:
                         st.error(f"KS test failed: {e}")
                 else:
-                    st.warning("⚠️ Not enough valid returns for Q-Q plot or KS test.")
+                    st.warning("⚠️ Not enough data for Q-Q plot or KS test (need ≥100 empirical returns).")
 
                 # ----------------------------
                 # Plot 3: Scenario Paths
