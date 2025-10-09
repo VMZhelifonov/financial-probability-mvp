@@ -19,7 +19,6 @@ def validate_ticker(ticker):
         return False, "Ticker is empty"
     try:
         info = yf.Ticker(ticker).info
-        # Many valid tickers have 'regularMarketPrice' or 'currentPrice'
         if 'regularMarketPrice' in info or 'currentPrice' in info or 'longName' in info:
             name = info.get('longName') or info.get('shortName') or ticker
             return True, name
@@ -314,103 +313,132 @@ model_choice = st.selectbox("Stochastic model", [
     "Regime-Switching Heston"
 ])
 
-# Only proceed if ticker is non-empty
-if ticker_input:
-    with st.spinner("Validating ticker..."):
-        is_valid, name_or_error = validate_ticker(ticker_input)
+run_button = st.button("🚀 Run Forecast")
 
-    if not is_valid:
-        st.error(f"❌ Invalid ticker '{ticker_input}': {name_or_error}. Try AAPL, MSFT, SPY, or BTC-USD.")
+if run_button:
+    if not ticker_input:
+        st.warning("Please enter a stock ticker.")
     else:
-        st.success(f"✅ Valid ticker: **{name_or_error}** ({ticker_input})")
-        with st.spinner("Running simulation..."):
-            all_paths, future_prices, current_price, model_desc, error = calibrate_and_simulate(
-                ticker_input, forecast_days, model_choice, n_paths=5000
-            )
+        with st.spinner("Validating ticker..."):
+            is_valid, name_or_error = validate_ticker(ticker_input)
 
-        if error:
-            st.error(f"Simulation error: {error}")
-        elif all_paths is None:
-            st.error("Unexpected error during simulation.")
+        if not is_valid:
+            st.error(f"❌ Invalid ticker '{ticker_input}': {name_or_error}. Try AAPL, MSFT, SPY, or BTC-USD.")
         else:
-            # ----------------------------
-            # Compute probabilities
-            # ----------------------------
-            p0 = current_price
-            p_up5 = p0 * 1.05
-            p_up10 = p0 * 1.10
-            p_down5 = p0 * 0.95
-            p_down10 = p0 * 0.90
+            st.success(f"✅ Valid ticker: **{name_or_error}** ({ticker_input})")
+            
+            # Show progress bar during simulation
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            status_text.text("Running simulation...")
 
-            prob_up_0_5 = np.mean((future_prices > p0) & (future_prices <= p_up5))
-            prob_up_5_10 = np.mean((future_prices > p_up5) & (future_prices <= p_up10))
-            prob_down_0_5 = np.mean((future_prices >= p_down5) & (future_prices < p0))
-            prob_down_5_10 = np.mean((future_prices >= p_down10) & (future_prices < p_down5))
-            prob_extreme = np.mean((future_prices > p_up10) | (future_prices < p_down10))
-            down_0_10 = prob_down_0_5 + prob_down_5_10
+            # Simulate with progress updates
+            try:
+                # Since calibrate_and_simulate is cached, we can't easily show real-time progress inside it.
+                # But we can at least show a "working" indicator.
+                # For true progress, we'd need to refactor — but for MVP, this is acceptable.
+                all_paths, future_prices, current_price, model_desc, error = calibrate_and_simulate(
+                    ticker_input, forecast_days, model_choice, n_paths=5000
+                )
+                progress_bar.progress(100)
+                status_text.text("Simulation complete!")
+            except Exception as e:
+                progress_bar.empty()
+                status_text.empty()
+                st.error(f"Simulation failed: {str(e)}")
+                st.stop()
 
-            # ----------------------------
-            # Find representative paths
-            # ----------------------------
-            def find_path_in_range(paths, lower, upper):
-                final = paths[:, -1]
-                mask = (final > lower) & (final <= upper)
-                if np.any(mask):
-                    idx = np.where(mask)[0][0]
-                    return paths[idx]
-                else:
-                    distances = np.abs(final - (lower + upper) / 2)
-                    idx = np.argmin(distances)
-                    return paths[idx]
+            if error:
+                progress_bar.empty()
+                status_text.empty()
+                st.error(f"Simulation error: {error}")
+            elif all_paths is None:
+                progress_bar.empty()
+                status_text.empty()
+                st.error("Unexpected error during simulation.")
+            else:
+                progress_bar.empty()
+                status_text.empty()
 
-            path_up_5_10 = find_path_in_range(all_paths, p_up5, p_up10)
-            path_up_0_5 = find_path_in_range(all_paths, p0, p_up5)
-            path_down_0_5 = find_path_in_range(all_paths, p_down5, p0)
-            path_down_5_10 = find_path_in_range(all_paths, p_down10, p_down5)
+                # ----------------------------
+                # Compute probabilities
+                # ----------------------------
+                p0 = current_price
+                p_up5 = p0 * 1.05
+                p_up10 = p0 * 1.10
+                p_down5 = p0 * 0.95
+                p_down10 = p0 * 0.90
 
-            # ----------------------------
-            # Display results
-            # ----------------------------
-            st.subheader(f"Current price: ${current_price:.2f}")
-            st.write(f"**{forecast_days}-day outlook for {name_or_error} ({ticker_input}) using {model_choice}:**")
-            st.write(f"- 📈 {prob_up_0_5:.0%} chance: +0% to +5%")
-            st.write(f"- 📈 {prob_up_5_10:.0%} chance: +5% to +10%")
-            st.write(f"- 📉 {down_0_10:.0%} chance: down to -10%")
-            st.write(f"- ⚠️ {prob_extreme:.0%} chance: extreme move (>±10%)")
+                prob_up_0_5 = np.mean((future_prices > p0) & (future_prices <= p_up5))
+                prob_up_5_10 = np.mean((future_prices > p_up5) & (future_prices <= p_up10))
+                prob_down_0_5 = np.mean((future_prices >= p_down5) & (future_prices < p0))
+                prob_down_5_10 = np.mean((future_prices >= p_down10) & (future_prices < p_down5))
+                prob_extreme = np.mean((future_prices > p_up10) | (future_prices < p_down10))
+                down_0_10 = prob_down_0_5 + prob_down_5_10
 
-            # Plot 1: Distribution
-            fig1, ax1 = plt.subplots(figsize=(8, 3.5))
-            ax1.hist(future_prices, bins=120, density=True, alpha=0.7, color='steelblue', edgecolor='none')
-            ax1.axvline(current_price, color='red', linestyle='--', linewidth=2, label='Current Price')
-            ax1.set_xlabel('Future Price ($)')
-            ax1.set_ylabel('Density')
-            ax1.set_title(f'{model_choice} Forecast Distribution')
-            ax1.legend()
-            ax1.grid(True, linestyle='--', alpha=0.5)
-            st.pyplot(fig1)
+                # ----------------------------
+                # Find representative paths
+                # ----------------------------
+                def find_path_in_range(paths, lower, upper):
+                    final = paths[:, -1]
+                    mask = (final > lower) & (final <= upper)
+                    if np.any(mask):
+                        idx = np.where(mask)[0][0]
+                        return paths[idx]
+                    else:
+                        distances = np.abs(final - (lower + upper) / 2)
+                        idx = np.argmin(distances)
+                        return paths[idx]
 
-            # Plot 2: Scenario paths
-            data = fetch_stock_data(ticker_input)
-            close_prices = data['Close'].dropna()
-            last_7_days = close_prices.iloc[-7:]
-            days_hist = np.arange(-6, 1)
-            days_forecast = np.arange(1, forecast_days + 1)
+                path_up_5_10 = find_path_in_range(all_paths, p_up5, p_up10)
+                path_up_0_5 = find_path_in_range(all_paths, p0, p_up5)
+                path_down_0_5 = find_path_in_range(all_paths, p_down5, p0)
+                path_down_5_10 = find_path_in_range(all_paths, p_down10, p_down5)
 
-            fig2, ax2 = plt.subplots(figsize=(8, 4))
-            ax2.plot(days_hist, last_7_days.values, 'o-', color='black', label='Last 7 Days', linewidth=2, markersize=4)
-            ax2.plot(days_forecast, path_up_5_10[1:], 'o--', color='green', label='+5% to +10%', linewidth=2, markersize=4)
-            ax2.plot(days_forecast, path_up_0_5[1:], 'o--', color='blue', label='+0% to +5%', linewidth=2, markersize=4)
-            ax2.plot(days_forecast, path_down_0_5[1:], 'o--', color='orange', label='-5% to 0%', linewidth=2, markersize=4)
-            ax2.plot(days_forecast, path_down_5_10[1:], 'o--', color='red', label='-10% to -5%', linewidth=2, markersize=4)
+                # ----------------------------
+                # Display results
+                # ----------------------------
+                st.subheader(f"Current price: ${current_price:.2f}")
+                st.write(f"**{forecast_days}-day outlook for {name_or_error} ({ticker_input}) using {model_choice}:**")
+                st.write(f"- 📈 {prob_up_0_5:.0%} chance: +0% to +5%")
+                st.write(f"- 📈 {prob_up_5_10:.0%} chance: +5% to +10%")
+                st.write(f"- 📉 {down_0_10:.0%} chance: down to -10%")
+                st.write(f"- ⚠️ {prob_extreme:.0%} chance: extreme move (>±10%)")
 
-            ax2.set_xlabel('Days (0 = today)')
-            ax2.set_ylabel('Price ($)')
-            ax2.set_title('Scenario Paths (Next {} Days)'.format(forecast_days))
-            ax2.axvline(0, color='gray', linestyle=':', linewidth=1)
-            ax2.legend()
-            ax2.grid(True, linestyle='--', alpha=0.5)
-            st.pyplot(fig2)
+                # Plot 1: Distribution
+                fig1, ax1 = plt.subplots(figsize=(8, 3.5))
+                ax1.hist(future_prices, bins=120, density=True, alpha=0.7, color='steelblue', edgecolor='none')
+                ax1.axvline(current_price, color='red', linestyle='--', linewidth=2, label='Current Price')
+                ax1.set_xlabel('Future Price ($)')
+                ax1.set_ylabel('Density')
+                ax1.set_title(f'{model_choice} Forecast Distribution')
+                ax1.legend()
+                ax1.grid(True, linestyle='--', alpha=0.5)
+                st.pyplot(fig1)
 
-            st.caption(f"Model: {model_desc} | Calibration: 2-year historical data | Paths: 5,000")
+                # Plot 2: Scenario paths
+                data = fetch_stock_data(ticker_input)
+                close_prices = data['Close'].dropna()
+                last_7_days = close_prices.iloc[-7:]
+                days_hist = np.arange(-6, 1)
+                days_forecast = np.arange(1, forecast_days + 1)
+
+                fig2, ax2 = plt.subplots(figsize=(8, 4))
+                ax2.plot(days_hist, last_7_days.values, 'o-', color='black', label='Last 7 Days', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_up_5_10[1:], 'o--', color='green', label='+5% to +10%', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_up_0_5[1:], 'o--', color='blue', label='+0% to +5%', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_down_0_5[1:], 'o--', color='orange', label='-5% to 0%', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_down_5_10[1:], 'o--', color='red', label='-10% to -5%', linewidth=2, markersize=4)
+
+                ax2.set_xlabel('Days (0 = today)')
+                ax2.set_ylabel('Price ($)')
+                ax2.set_title('Scenario Paths (Next {} Days)'.format(forecast_days))
+                ax2.axvline(0, color='gray', linestyle=':', linewidth=1)
+                ax2.legend()
+                ax2.grid(True, linestyle='--', alpha=0.5)
+                st.pyplot(fig2)
+
+                st.caption(f"Model: {model_desc} | Calibration: 2-year historical data | Paths: 5,000")
+
 else:
-    st.info("👆 Enter a stock ticker to begin.")
+    st.info("👆 Adjust parameters and click **'Run Forecast'** to start.")
