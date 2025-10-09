@@ -1,6 +1,3 @@
-Можно ли в моём боте улучшить калибровку моделей, сделав её более профессиональной ?
-
-
 import streamlit as st
 import yfinance as yf
 import numpy as np
@@ -385,3 +382,4 @@ if ticker:
 
     except Exception as e:
         st.error(f"Error: {str(e)}. Try a major ticker like AAPL, MSFT, or SPY.")
+
