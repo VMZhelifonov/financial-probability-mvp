@@ -32,8 +32,11 @@ if ticker:
             st.error("No data found. Try a liquid ticker (e.g. AAPL, SPY).")
         else:
             close_prices = data['Close'].dropna()
-            if len(close_prices) < 60:
-                st.error("Not enough data. Need ≥60 days.")
+            # 🔴 КРИТИЧЕСКАЯ ПРОВЕРКА: пуст ли ряд после dropna?
+            if close_prices.empty:
+                st.error("Price data contains only missing values. Try a major ticker like AAPL or SPY.")
+            elif len(close_prices) < 60:
+                st.error("Not enough data. Need ≥60 days of valid prices.")
             else:
                 current_price = float(close_prices.iloc[-1])
                 log_prices = np.log(close_prices.values)
@@ -368,7 +371,7 @@ if ticker:
                     if emp_std > 1e-8 and sim_std > 1e-8:
                         emp_norm = (log_returns - np.mean(log_returns)) / emp_std
                         sim_norm = (simulated_returns - np.mean(simulated_returns)) / sim_std
-                        ks_stat, ks_p = stats.kstest(emp_norm, lambda x: stats.norm.cdf(x))
+                        ks_stat, ks_p = stats.kstest(emp_norm, 'norm')
                         ks_ok = ks_p > 0.05
                 except Exception:
                     ks_ok = False
