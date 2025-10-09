@@ -315,16 +315,22 @@ if ticker:
                     model_desc = "Fallback GBM"
 
                 # ----------------------------
-                # Extract 1-day simulated returns for validation
+                # Extract 1-day simulated returns for validation (SAFE VERSION)
                 # ----------------------------
                 simulated_prices_1d = all_paths[:, 1]  # price after 1 day
                 simulated_log_returns = np.log(simulated_prices_1d / current_price)
-                simulated_log_returns = simulated_log_returns[np.isfinite(simulated_log_returns)]
+                simulated_log_returns = simulated_log_returns[np.isfinite(simulated_log_returns) & (np.abs(simulated_log_returns) > 1e-12)]
 
-                # Keep only empirical returns that are finite
-                empirical_log_returns = log_returns[-len(simulated_log_returns):]  # align length
-                if len(empirical_log_returns) == 0:
-                    empirical_log_returns = log_returns
+                empirical_log_returns = log_returns[np.isfinite(log_returns) & (np.abs(log_returns) > 1e-12)]
+
+                qq_available = True
+                if len(simulated_log_returns) < 10 or len(empirical_log_returns) < 10:
+                    qq_available = False
+                else:
+                    n_compare = min(len(empirical_log_returns), len(simulated_log_returns), 5000)
+                    # Random subsample for speed and fairness
+                    emp_sample = np.random.choice(empirical_log_returns, size=n_compare, replace=False)
+                    sim_sample = np.random.choice(simulated_log_returns, size=n_compare, replace=False)
 
                 # ----------------------------
                 # Probabilities
@@ -386,38 +392,42 @@ if ticker:
                 ax1.legend()
                 ax1.grid(True, linestyle='--', alpha=0.5)
                 st.pyplot(fig1)
+                plt.close(fig1)
 
                 # ----------------------------
-                # Plot 2: Q-Q Plot
+                # Plot 2: Q-Q Plot (if available)
                 # ----------------------------
-                fig2, ax2 = plt.subplots(figsize=(6, 6))
-                # Sort both samples
-                emp_sorted = np.sort(empirical_log_returns)
-                sim_sorted = np.sort(simulated_log_returns[:len(emp_sorted)])
-                # Theoretical quantiles (from empirical)
-                probs = (np.arange(1, len(emp_sorted)+1) - 0.5) / len(emp_sorted)
-                ax2.scatter(emp_sorted, sim_sorted, alpha=0.6, s=10)
-                ax2.plot([emp_sorted.min(), emp_sorted.max()], [emp_sorted.min(), emp_sorted.max()], 'r--', linewidth=1.5)
-                ax2.set_xlabel('Empirical Log-Returns Quantiles')
-                ax2.set_ylabel('Model Simulated Quantiles')
-                ax2.set_title('Q-Q Plot: Empirical vs Model (1-day)')
-                ax2.grid(True, linestyle='--', alpha=0.5)
-                st.pyplot(fig2)
+                if qq_available:
+                    fig2, ax2 = plt.subplots(figsize=(6, 6))
+                    emp_sorted = np.sort(emp_sample)
+                    sim_sorted = np.sort(sim_sample)
+                    ax2.scatter(emp_sorted, sim_sorted, alpha=0.6, s=10, color='steelblue')
+                    min_val = min(emp_sorted.min(), sim_sorted.min())
+                    max_val = max(emp_sorted.max(), sim_sorted.max())
+                    ax2.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=1.5)
+                    ax2.set_xlabel('Empirical Log-Returns Quantiles')
+                    ax2.set_ylabel('Model Simulated Quantiles')
+                    ax2.set_title('Q-Q Plot: Empirical vs Model (1-day)')
+                    ax2.grid(True, linestyle='--', alpha=0.5)
+                    st.pyplot(fig2)
+                    plt.close(fig2)
 
-                # ----------------------------
-                # KS Test
-                # ----------------------------
-                try:
-                    ks_stat, p_value = stats.ks_2samp(empirical_log_returns, simulated_log_returns)
-                    st.markdown(f"**Kolmogorov-Smirnov Test (Empirical vs Model):**")
-                    st.write(f"- KS Statistic: {ks_stat:.4f}")
-                    st.write(f"- p-value: {p_value:.4f}")
-                    if p_value > 0.05:
-                        st.success("✅ Model distribution is statistically indistinguishable from empirical (p > 0.05)")
-                    else:
-                        st.warning("⚠️ Model distribution differs significantly from empirical (p ≤ 0.05)")
-                except Exception as e:
-                    st.error(f"KS test failed: {e}")
+                    # ----------------------------
+                    # KS Test
+                    # ----------------------------
+                    try:
+                        ks_stat, p_value = stats.ks_2samp(emp_sample, sim_sample)
+                        st.markdown(f"**Kolmogorov-Smirnov Test (Empirical vs Model):**")
+                        st.write(f"- KS Statistic: {ks_stat:.4f}")
+                        st.write(f"- p-value: {p_value:.4f}")
+                        if p_value > 0.05:
+                            st.success("✅ Model distribution is statistically indistinguishable from empirical (p > 0.05)")
+                        else:
+                            st.warning("⚠️ Model distribution differs significantly from empirical (p ≤ 0.05)")
+                    except Exception as e:
+                        st.error(f"KS test failed: {e}")
+                else:
+                    st.warning("⚠️ Not enough valid returns for Q-Q plot or KS test.")
 
                 # ----------------------------
                 # Plot 3: Scenario Paths
@@ -440,6 +450,7 @@ if ticker:
                 ax3.legend()
                 ax3.grid(True, linestyle='--', alpha=0.5)
                 st.pyplot(fig3)
+                plt.close(fig3)
 
                 st.caption(f"Model: {model_desc} | Calibration: 2-year historical data | Paths: 20,000")
 
