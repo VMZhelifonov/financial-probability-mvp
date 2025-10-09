@@ -30,12 +30,15 @@ if ticker:
         data = yf.download(ticker, period="2y", progress=False)
         if data.empty:
             st.error("No data found. Try a liquid ticker (e.g. AAPL, SPY).")
+            st.stop()
         else:
             close_prices = data['Close'].dropna()
             if close_prices.empty:
                 st.error("Price data contains only missing values. Try a major ticker like AAPL or SPY.")
+                st.stop()
             elif len(close_prices) < 60:
                 st.error("Not enough data. Need ≥60 days of valid prices.")
+                st.stop()
             else:
                 current_price = float(close_prices.iloc[-1])
                 log_prices = np.log(close_prices.values)
