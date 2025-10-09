@@ -32,7 +32,6 @@ if ticker:
             st.error("No data found. Try a liquid ticker (e.g. AAPL, SPY).")
         else:
             close_prices = data['Close'].dropna()
-            # 🔴 КРИТИЧЕСКАЯ ПРОВЕРКА: пуст ли ряд после dropna?
             if close_prices.empty:
                 st.error("Price data contains only missing values. Try a major ticker like AAPL or SPY.")
             elif len(close_prices) < 60:
@@ -47,15 +46,11 @@ if ticker:
                     mu_hist = 0.0
                 else:
                     sigma_hist = float(np.std(log_returns) * np.sqrt(252))
-                    mu_hist = float(np.mean(log_returns) * 252)  # annualized drift
+                    mu_hist = float(np.mean(log_returns) * 252)
 
-                # ----------------------------
-                # ADF Test for Stationarity & Trend Estimation
-                # ----------------------------
+                # ADF Test & Trend
                 adf_result = adfuller(log_prices)
-                is_stationary = adf_result[1] < 0.05  # p-value < 5%
-
-                # Estimate linear trend safely
+                is_stationary = adf_result[1] < 0.05
                 trend_annualized = 0.0
                 if len(log_prices) >= 2:
                     n_trend = min(60, len(log_prices))
@@ -88,7 +83,7 @@ if ticker:
                     return S
 
                 # ----------------------------
-                # Heston Calibration (variance + autocorr of squared returns)
+                # Heston Calibration
                 # ----------------------------
                 def calibrate_heston(log_returns):
                     if len(log_returns) < 50:
@@ -335,15 +330,18 @@ if ticker:
                     all_paths = simulate_gbm_paths(current_price, mu_hist, sigma_hist, T, n_paths=20000, n_steps=n_steps, seed=use_seed)
                     model_desc = "Fallback GBM"
 
+                # 🔴 КРИТИЧЕСКАЯ ПРОВЕРКА: не пустой ли all_paths?
+                if all_paths.size == 0 or all_paths.shape[0] == 0:
+                    st.error("Simulation returned empty paths. Try a different model or ticker.")
+                    st.stop()
+
                 future_prices = all_paths[:, -1]
                 future_prices = future_prices[np.isfinite(future_prices)]
                 if len(future_prices) == 0:
                     st.error("Simulation produced no valid prices.")
                     st.stop()
 
-                # ----------------------------
-                # Dynamic thresholds based on volatility (2σ)
-                # ----------------------------
+                # Dynamic thresholds
                 vol_forecast = sigma_hist * np.sqrt(T)
                 p_up2σ = current_price * np.exp(2 * vol_forecast)
                 p_down2σ = current_price * np.exp(-2 * vol_forecast)
@@ -356,18 +354,20 @@ if ticker:
                 prob_down_1σ_2σ = np.mean((future_prices >= p_down2σ) & (future_prices < p_down1σ))
                 prob_extreme = np.mean((future_prices > p_up2σ) | (future_prices < p_down2σ))
 
-                # ----------------------------
                 # Model Validation: Q-Q Plot & KS Test
-                # ----------------------------
                 empirical_quantiles = np.quantile(log_returns, [0.1, 0.25, 0.5, 0.75, 0.9])
                 simulated_returns = np.log(all_paths[:, -1] / all_paths[:, 0])
-                model_quantiles = np.quantile(simulated_returns, [0.1, 0.25, 0.5, 0.75, 0.9])
+                simulated_returns = simulated_returns[np.isfinite(simulated_returns)]
+                if len(simulated_returns) == 0:
+                    model_quantiles = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
+                else:
+                    model_quantiles = np.quantile(simulated_returns, [0.1, 0.25, 0.5, 0.75, 0.9])
 
                 ks_ok = False
                 ks_p = 0.0
                 try:
                     emp_std = np.std(log_returns)
-                    sim_std = np.std(simulated_returns)
+                    sim_std = np.std(simulated_returns) if len(simulated_returns) > 1 else 0.0
                     if emp_std > 1e-8 and sim_std > 1e-8:
                         emp_norm = (log_returns - np.mean(log_returns)) / emp_std
                         sim_norm = (simulated_returns - np.mean(simulated_returns)) / sim_std
@@ -377,9 +377,7 @@ if ticker:
                     ks_ok = False
                     ks_p = 0.0
 
-                # ----------------------------
                 # Output
-                # ----------------------------
                 st.subheader(f"Current price: ${current_price:.2f}")
                 st.write(f"**{forecast_days}-day outlook for {ticker} ({model_choice}):**")
                 st.write(f"- 📈 {prob_up_0_1σ:.0%} chance: +0σ to +1σ (${current_price:.2f} → ${p_up1σ:.2f})")
