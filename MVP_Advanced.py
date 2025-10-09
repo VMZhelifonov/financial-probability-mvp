@@ -1,8 +1,10 @@
 import streamlit as st
 import yfinance as yf
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
+import io
 
 # ----------------------------
 # КЭШИРОВАНИЕ ДАННЫХ И МОДЕЛЕЙ
@@ -313,6 +315,10 @@ model_choice = st.selectbox("Stochastic model", [
     "Regime-Switching Heston"
 ])
 
+# Новое поле: целевая цена
+target_price_input = st.text_input("🎯 Target price (optional)", value="")
+compare_with_spy = st.checkbox("📊 Compare with S&P 500 (SPY)")
+
 run_button = st.button("🚀 Run Forecast")
 
 if run_button:
@@ -327,16 +333,11 @@ if run_button:
         else:
             st.success(f"✅ Valid ticker: **{name_or_error}** ({ticker_input})")
             
-            # Show progress bar during simulation
             progress_bar = st.progress(0)
             status_text = st.empty()
             status_text.text("Running simulation...")
 
-            # Simulate with progress updates
             try:
-                # Since calibrate_and_simulate is cached, we can't easily show real-time progress inside it.
-                # But we can at least show a "working" indicator.
-                # For true progress, we'd need to refactor — but for MVP, this is acceptable.
                 all_paths, future_prices, current_price, model_desc, error = calibrate_and_simulate(
                     ticker_input, forecast_days, model_choice, n_paths=5000
                 )
@@ -361,7 +362,23 @@ if run_button:
                 status_text.empty()
 
                 # ----------------------------
-                # Compute probabilities
+                # Target price probability
+                # ----------------------------
+                target_price = None
+                if target_price_input.strip():
+                    try:
+                        target_price = float(target_price_input.strip())
+                        if target_price <= 0:
+                            st.warning("Target price must be positive.")
+                        else:
+                            prob_above = np.mean(future_prices >= target_price)
+                            prob_below = 1 - prob_above
+                            st.info(f"🎯 Probability that **{ticker_input} ≥ ${target_price:.2f}** in {forecast_days} days: **{prob_above:.1%}**")
+                    except ValueError:
+                        st.warning("Invalid target price. Please enter a number.")
+
+                # ----------------------------
+                # Compute base probabilities
                 # ----------------------------
                 p0 = current_price
                 p_up5 = p0 * 1.05
@@ -409,6 +426,8 @@ if run_button:
                 fig1, ax1 = plt.subplots(figsize=(8, 3.5))
                 ax1.hist(future_prices, bins=120, density=True, alpha=0.7, color='steelblue', edgecolor='none')
                 ax1.axvline(current_price, color='red', linestyle='--', linewidth=2, label='Current Price')
+                if target_price and target_price > 0:
+                    ax1.axvline(target_price, color='purple', linestyle='-.', linewidth=2, label=f'Target ${target_price:.2f}')
                 ax1.set_xlabel('Future Price ($)')
                 ax1.set_ylabel('Density')
                 ax1.set_title(f'{model_choice} Forecast Distribution')
@@ -439,6 +458,54 @@ if run_button:
                 st.pyplot(fig2)
 
                 st.caption(f"Model: {model_desc} | Calibration: 2-year historical data | Paths: 5,000")
+
+                # ----------------------------
+                # Сравнение с SPY (если выбрано)
+                # ----------------------------
+                if compare_with_spy:
+                    st.markdown("---")
+                    st.subheader("🆚 Comparison with S&P 500 (SPY)")
+                    with st.spinner("Simulating SPY scenarios..."):
+                        spy_paths, spy_future, spy_price, _, _ = calibrate_and_simulate(
+                            "SPY", forecast_days, "GBM (Baseline)", n_paths=2000
+                        )
+                    if spy_paths is not None:
+                        spy_prob_up = np.mean(spy_future > spy_price)
+                        st.write(f"**SPY current: ${spy_price:.2f}** | Prob of gain in {forecast_days} days: **{spy_prob_up:.1%}**")
+
+                        # Plot SPY distribution
+                        fig3, ax3 = plt.subplots(figsize=(8, 3))
+                        ax3.hist(spy_future, bins=80, density=True, alpha=0.6, color='gray', label='SPY')
+                        ax3.hist(future_prices, bins=80, density=True, alpha=0.6, color='steelblue', label=ticker_input)
+                        ax3.axvline(spy_price, color='black', linestyle='--', label='SPY Today')
+                        ax3.axvline(current_price, color='red', linestyle='--', label=f'{ticker_input} Today')
+                        ax3.set_xlabel('Future Price ($)')
+                        ax3.set_ylabel('Density')
+                        ax3.set_title('Forecast Distribution: {} vs SPY'.format(ticker_input))
+                        ax3.legend()
+                        ax3.grid(True, linestyle='--', alpha=0.5)
+                        st.pyplot(fig3)
+                    else:
+                        st.warning("Could not simulate SPY.")
+
+                # ----------------------------
+                # Экспорт в CSV
+                # ----------------------------
+                st.markdown("---")
+                st.subheader("📥 Export Forecast Data")
+                # Создаём DataFrame: каждая строка — один сценарий, столбцы — дни (0 = сегодня, 1...forecast_days)
+                df_export = pd.DataFrame(all_paths)
+                df_export.columns = [f"Day_{i}" for i in range(forecast_days + 1)]
+                csv_buffer = io.StringIO()
+                df_export.to_csv(csv_buffer, index=False)
+                csv_data = csv_buffer.getvalue()
+
+                st.download_button(
+                    label="💾 Download Forecast Scenarios (CSV)",
+                    data=csv_data,
+                    file_name=f"{ticker_input}_forecast_{forecast_days}d.csv",
+                    mime="text/csv"
+                )
 
 else:
     st.info("👆 Adjust parameters and click **'Run Forecast'** to start.")
