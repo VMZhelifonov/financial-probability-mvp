@@ -46,6 +46,93 @@ def compute_rsi(prices, window=14):
 
 
 # ----------------------------
+# Байесовский анализ сигналов (отдельная функция)
+# ----------------------------
+def bayesian_signal_analysis(ticker, current_price, future_prices, fetch_stock_data):
+    """
+    Perform Bayesian signal analysis based on technical indicators.
+    Returns a dictionary with results or None if not enough data.
+    """
+    try:
+        # Используем уже загруженные данные
+        full_data = fetch_stock_data(ticker)
+        prices_for_ta = full_data['Close'].dropna()
+        volumes = full_data.get('Volume', pd.Series()).dropna()
+
+        signals = {}
+        
+        # SMA Signal
+        if len(prices_for_ta) >= 50:
+            sma20 = prices_for_ta.rolling(window=20).mean()
+            sma50 = prices_for_ta.rolling(window=50).mean()
+            current_sma20 = sma20.iloc[-1]
+            current_sma50 = sma50.iloc[-1]
+            signal_sma = 1 if (current_price > current_sma20) and (current_sma20 > current_sma50) else 0
+            signals['sma'] = {
+                'value': signal_sma,
+                'name': 'SMA(20/50)',
+                'description': "Bullish Trend (Price > SMA20 > SMA50)" if signal_sma else "No Bullish Trend"
+            }
+        else:
+            signals['sma'] = None
+
+        # RSI Signal
+        if len(prices_for_ta) >= 15:
+            rsi_series = compute_rsi(prices_for_ta, window=14)
+            current_rsi = rsi_series.iloc[-1]
+            signal_rsi = 1 if current_rsi < 40 else 0
+            signals['rsi'] = {
+                'value': signal_rsi,
+                'name': 'RSI(14)',
+                'description': "Oversold (RSI < 40)" if signal_rsi else "Not Oversold (RSI ≥ 40)"
+            }
+        else:
+            signals['rsi'] = None
+
+        # Volume Signal
+        signal_volume = None
+        if len(volumes) >= 20 and volumes.iloc[-1] > 0:
+            avg_vol_20 = volumes.tail(21).iloc[:-1].mean()
+            current_vol = volumes.iloc[-1]
+            signal_volume = 1 if current_vol > avg_vol_20 else 0
+            signals['volume'] = {
+                'value': signal_volume,
+                'name': 'Volume',
+                'description': "Above Avg Volume" if signal_volume else "Below Avg Volume"
+            }
+        else:
+            signals['volume'] = None
+
+        # Априорная вероятность роста
+        P_up_prior = np.mean(future_prices > current_price)
+        P_up_posterior = P_up_prior
+
+        # Чувствительности
+        sens_sma = 0.55
+        sens_rsi = 0.52
+        sens_volume = 0.51
+
+        # Последовательное обновление только для активных сигналов
+        if signals['sma'] is not None and signals['sma']['value'] == 1:
+            P_up_posterior = (sens_sma * P_up_posterior) / (sens_sma * P_up_posterior + (1 - sens_sma) * (1 - P_up_posterior))
+        if signals['rsi'] is not None and signals['rsi']['value'] == 1:
+            P_up_posterior = (sens_rsi * P_up_posterior) / (sens_rsi * P_up_posterior + (1 - sens_rsi) * (1 - P_up_posterior))
+        if signals['volume'] is not None and signals['volume']['value'] == 1:
+            P_up_posterior = (sens_volume * P_up_posterior) / (sens_volume * P_up_posterior + (1 - sens_volume) * (1 - P_up_posterior))
+
+        # Ограничение
+        P_up_posterior = np.clip(P_up_posterior, 0.01, 0.99)
+
+        return {
+            'signals': signals,
+            'prior': P_up_prior,
+            'posterior': P_up_posterior
+        }
+    except Exception as e:
+        return None
+
+
+# ----------------------------
 # КЭШИРОВАНИЕ ДАННЫХ И МОДЕЛЕЙ
 # ----------------------------
 @st.cache_data(ttl=3600)
@@ -558,71 +645,19 @@ if run_button:
                 st.caption(f"Model: {model_desc} | Calibration: 2-year historical data | Paths: 5,000")
 
                 # ----------------------------
-                # 🔍 Bayesian Signal Analysis (Experimental)
+                # 🔍 Bayesian Signal Analysis (Experimental) - теперь как отдельный функционал
                 # ----------------------------
-                try:
-                    # Используем уже загруженные данные
-                    full_data = fetch_stock_data(ticker_input)
-                    prices_for_ta = full_data['Close'].dropna()
-                    volumes = full_data.get('Volume', pd.Series()).dropna()
-
-                    if len(prices_for_ta) >= 50:
-                        # SMA
-                        sma20 = prices_for_ta.rolling(window=20).mean()
-                        sma50 = prices_for_ta.rolling(window=50).mean()
-                        current_sma20 = sma20.iloc[-1]
-                        current_sma50 = sma50.iloc[-1]
-                        signal_sma = 1 if (current_price > current_sma20) and (current_sma20 > current_sma50) else 0
-                    else:
-                        signal_sma = None
-
-                    if len(prices_for_ta) >= 15:
-                        rsi_series = compute_rsi(prices_for_ta, window=14)
-                        current_rsi = rsi_series.iloc[-1]
-                        signal_rsi = 1 if current_rsi < 40 else 0
-                    else:
-                        signal_rsi = None
-
-                    signal_volume = None
-                    if len(volumes) >= 20 and volumes.iloc[-1] > 0:
-                        avg_vol_20 = volumes.tail(21).iloc[:-1].mean()  # последние 20 дней, исключая сегодня
-                        current_vol = volumes.iloc[-1]
-                        signal_volume = 1 if current_vol > avg_vol_20 else 0
-
-                    # Априорная вероятность роста
-                    P_up_prior = np.mean(future_prices > current_price)
-                    P_up_posterior = P_up_prior
-
-                    # Чувствительности
-                    sens_sma = 0.55
-                    sens_rsi = 0.52
-                    sens_volume = 0.51
-
-                    # Последовательное обновление
-                    if signal_sma == 1:
-                        P_up_posterior = (sens_sma * P_up_posterior) / (sens_sma * P_up_posterior + (1 - sens_sma) * (1 - P_up_posterior))
-                    if signal_rsi == 1:
-                        P_up_posterior = (sens_rsi * P_up_posterior) / (sens_rsi * P_up_posterior + (1 - sens_rsi) * (1 - P_up_posterior))
-                    if signal_volume == 1:
-                        P_up_posterior = (sens_volume * P_up_posterior) / (sens_volume * P_up_posterior + (1 - sens_volume) * (1 - P_up_posterior))
-
-                    # Ограничение
-                    P_up_posterior = np.clip(P_up_posterior, 0.01, 0.99)
-
-                    # Отображение
+                bayes_result = bayesian_signal_analysis(ticker_input, current_price, future_prices, fetch_stock_data)
+                if bayes_result is not None:
                     with st.expander("🔍 Bayesian Signal Analysis (Experimental)"):
                         st.markdown("#### Technical Signal Assessment")
                         
                         signals_info = []
-                        if signal_sma is not None:
-                            sma_status = "✅ Bullish Trend (Price > SMA20 > SMA50)" if signal_sma else "❌ No Bullish Trend"
-                            signals_info.append(("SMA(20/50)", sma_status))
-                        if signal_rsi is not None:
-                            rsi_status = "✅ Oversold (RSI < 40)" if signal_rsi else "❌ Not Oversold (RSI ≥ 40)"
-                            signals_info.append(("RSI(14)", rsi_status))
-                        if signal_volume is not None:
-                            vol_status = "✅ Above Avg Volume" if signal_volume else "❌ Below Avg Volume"
-                            signals_info.append(("Volume", vol_status))
+                        for signal_key in ['sma', 'rsi', 'volume']:
+                            signal_data = bayes_result['signals'][signal_key]
+                            if signal_data is not None:
+                                status = "✅ " + signal_data['description'] if signal_data['value'] == 1 else "❌ " + signal_data['description']
+                                signals_info.append((signal_data['name'], status))
                         
                         if signals_info:
                             for signal_name, status in signals_info:
@@ -630,8 +665,8 @@ if run_button:
                         else:
                             st.write("Not enough data for signal analysis.")
 
-                        st.write(f"- **Prior probability of upside**: {P_up_prior:.1%}")
-                        st.write(f"- **Posterior probability of upside**: {P_up_posterior:.1%}")
+                        st.write(f"- **Prior probability of upside**: {bayes_result['prior']:.1%}")
+                        st.write(f"- **Posterior probability of upside**: {bayes_result['posterior']:.1%}")
 
                         st.warning(
                             "⚠️ **This is a hypothetical calculation. Signals are NOT used in the main stochastic model. "
@@ -640,9 +675,6 @@ if run_button:
                         st.caption(
                             "*Based on simplified Bayesian updating with heuristic signal sensitivities. For research only.*"
                         )
-                except Exception as e:
-                    # Молча пропускаем, если что-то пошло не так
-                    pass
 
                 # ----------------------------
                 # Сравнение с SPY (если выбрано)
@@ -676,9 +708,6 @@ if run_button:
                 # ----------------------------
                 # Экспорт в CSV
                 # ----------------------------
-                                # ----------------------------
-                # Экспорт в CSV
-                # ----------------------------
                 st.markdown("---")
                 st.subheader("📥 Export Forecast Data")
                 # Создаём DataFrame: каждая строка — один сценарий.
@@ -699,5 +728,3 @@ if run_button:
                 )
 else:
     st.info("👆 Adjust parameters and click **'Run Forecast'** to start.")
-
-
