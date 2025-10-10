@@ -7,6 +7,45 @@ from scipy.optimize import minimize
 import io
 
 # ----------------------------
+# Вспомогательная функция для доверительного интервала Уилсона
+# ----------------------------
+def wilson_confidence_interval(count, nobs, alpha=0.05):
+    """
+    Calculate Wilson confidence interval for a proportion.
+    Returns (lower_bound, upper_bound).
+    """
+    if nobs == 0:
+        return 0.0, 0.0
+    if count == 0:
+        return 0.0, 1.0 - (alpha / 2) ** (1 / nobs)
+    if count == nobs:
+        return (alpha / 2) ** (1 / nobs), 1.0
+
+    z = 1.96  # For 95% CI
+    p = count / nobs
+    denominator = 1 + z**2 / nobs
+    centre_adjusted_probability = p + z**2 / (2 * nobs)
+    adjusted_standard_deviation = np.sqrt((p * (1 - p) + z**2 / (4 * nobs)) / nobs)
+
+    lower_bound = (centre_adjusted_probability - z * adjusted_standard_deviation) / denominator
+    upper_bound = (centre_adjusted_probability + z * adjusted_standard_deviation) / denominator
+
+    return np.clip(lower_bound, 0.0, 1.0), np.clip(upper_bound, 0.0, 1.0)
+
+
+# ----------------------------
+# Функция для расчёта RSI
+# ----------------------------
+def compute_rsi(prices, window=14):
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / (loss + 1e-8)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+# ----------------------------
 # КЭШИРОВАНИЕ ДАННЫХ И МОДЕЛЕЙ
 # ----------------------------
 @st.cache_data(ttl=3600)
@@ -33,6 +72,18 @@ def validate_ticker(ticker):
 def calibrate_and_simulate(
     ticker, forecast_days, model_choice, n_paths=5000, seed=42
 ):
+    # Получаем дивидендную доходность
+    try:
+        ticker_info = yf.Ticker(ticker).info
+        div_yield = ticker_info.get('dividendYield', 0.0)
+        if not isinstance(div_yield, (int, float)) or div_yield is None:
+            div_yield = 0.0
+        div_yield = float(div_yield)
+    except:
+        div_yield = 0.0
+
+    risk_free = 0.05  # Фиксированная безрисковая ставка
+
     data = fetch_stock_data(ticker)
     if data.empty:
         return None, None, None, None, "No historical data"
@@ -45,28 +96,38 @@ def calibrate_and_simulate(
     log_prices = np.log(close_prices.values)
     log_returns = np.diff(log_prices)
     log_returns = log_returns[np.isfinite(log_returns)]
+    
+    # Улучшенная оценка волатильности
     sigma_hist = float(np.std(log_returns) * np.sqrt(252)) if len(log_returns) >= 20 else 0.2
+    if len(log_returns) >= 30:
+        realized_vol = np.std(log_returns[-30:]) * np.sqrt(252)
+        sigma_hist = 0.7 * sigma_hist + 0.3 * realized_vol
 
     T = forecast_days / 252.0
-    n_steps = forecast_days
+    # Адаптивная временная дискретизация
+    n_steps = max(forecast_days, 10)
+    dt = T / n_steps
 
     # ----------------------------
-    # GBM
+    # GBM с рыночными параметрами
     # ----------------------------
-    def simulate_gbm_paths(S0, vol, T, n_paths=5000, n_steps=None, seed=42):
+    def simulate_gbm_paths(S0, vol, T, n_paths=5000, n_steps=None, seed=42, div_yield=0.0, risk_free=0.05):
         if n_steps is None:
-            n_steps = int(T * 252)
+            n_steps = max(int(T * 252), 10)
+        dt = T / n_steps
         np.random.seed(seed)
-        dt = 1/252
         if n_steps == 0:
             return np.full((n_paths, 1), S0)
         Z = np.random.randn(n_paths, n_steps)
-        logS = np.log(S0) + np.cumsum(-0.5 * vol**2 * dt + vol * np.sqrt(dt) * Z, axis=1)
+        # Исправленный дрейф с учётом дивидендов и безрисковой ставки
+        drift = (risk_free - div_yield - 0.5 * vol**2) * dt
+        diffusion = vol * np.sqrt(dt) * Z
+        logS = np.log(S0) + np.cumsum(drift + diffusion, axis=1)
         S = np.exp(np.hstack([np.full((n_paths, 1), S0), logS]))
-        return S
+        return np.maximum(S, 1e-8)
 
     # ----------------------------
-    # Heston
+    # Heston с Full Truncation
     # ----------------------------
     def calibrate_heston(log_returns):
         if len(log_returns) < 20:
@@ -104,26 +165,30 @@ def calibrate_and_simulate(
         except:
             return x0
 
-    def simulate_heston_paths(S0, kappa, theta, xi, rho, v0, T, n_paths=5000, n_steps=None, seed=42):
+    def simulate_heston_paths(S0, kappa, theta, xi, rho, v0, T, n_paths=5000, n_steps=None, seed=42, div_yield=0.0, risk_free=0.05):
         if n_steps is None:
-            n_steps = int(T * 252)
+            n_steps = max(int(T * 252), 10)
+        dt = T / n_steps
         np.random.seed(seed)
-        dt = 1/252
         if n_steps == 0:
             return np.full((n_paths, 1), S0)
         S = np.full((n_paths, n_steps+1), S0, dtype=np.float64)
         v = np.full(n_paths, v0, dtype=np.float64)
-        sqrt_dt = np.sqrt(dt)
         for t in range(1, n_steps+1):
             Z1 = np.random.randn(n_paths)
             Z2 = rho * Z1 + np.sqrt(1 - rho**2) * np.random.randn(n_paths)
-            v = np.maximum(v, 0.0)
-            S[:, t] = S[:, t-1] * np.exp(np.sqrt(v) * sqrt_dt * Z1 - 0.5 * v * dt)
-            v += kappa * (theta - v) * dt + xi * np.sqrt(v) * sqrt_dt * Z2
+            # Full Truncation Scheme
+            v_plus = np.maximum(v, 0.0)
+            # Исправленный дрейф для цены
+            drift = (risk_free - div_yield - 0.5 * v_plus) * dt
+            diffusion = np.sqrt(v_plus * dt) * Z1
+            S[:, t] = S[:, t-1] * np.exp(drift + diffusion)
+            # Обновление волатильности
+            v = v + kappa * (theta - v_plus) * dt + xi * np.sqrt(v_plus * dt) * Z2
         return np.maximum(S, 1e-8)
 
     # ----------------------------
-    # SABR
+    # SABR с логнормальной формой
     # ----------------------------
     def calibrate_sabr(log_returns, current_price):
         beta = 0.5
@@ -156,24 +221,26 @@ def calibrate_and_simulate(
 
     def simulate_sabr_paths(F0, alpha0, beta, nu, T, n_paths=5000, n_steps=None, seed=42):
         if n_steps is None:
-            n_steps = int(T * 252)
+            n_steps = max(int(T * 252), 10)
+        dt = T / n_steps
         np.random.seed(seed)
-        dt = 1/252
         if n_steps == 0:
             return np.full((n_paths, 1), F0)
         F = np.full((n_paths, n_steps+1), F0, dtype=np.float64)
         alpha = np.full(n_paths, alpha0, dtype=np.float64)
-        sqrt_dt = np.sqrt(dt)
         for t in range(1, n_steps+1):
             Z1 = np.random.randn(n_paths)
             Z2 = np.random.randn(n_paths)
-            F[:, t] = F[:, t-1] + alpha * (np.maximum(F[:, t-1], 1e-8) ** beta) * sqrt_dt * Z1
-            alpha *= np.exp(-0.5 * nu**2 * dt + nu * sqrt_dt * Z2)
-            F[:, t] = np.maximum(F[:, t], 1e-8)
-        return F
+            # Логнормальная форма SABR
+            F_prev = np.maximum(F[:, t-1], 1e-8)
+            dlogF = -0.5 * (alpha**2) * (F_prev**(2*beta - 2)) * dt + alpha * (F_prev**(beta - 1)) * np.sqrt(dt) * Z1
+            F[:, t] = F_prev * np.exp(dlogF)
+            # Обновление альфы
+            alpha *= np.exp(-0.5 * nu**2 * dt + nu * np.sqrt(dt) * Z2)
+        return np.maximum(F, 1e-8)
 
     # ----------------------------
-    # Double Exponential Jump-Diffusion
+    # Double Exponential Jump-Diffusion с рыночными параметрами
     # ----------------------------
     def calibrate_kou(log_returns):
         if len(log_returns) < 50:
@@ -195,17 +262,19 @@ def calibrate_and_simulate(
         p = np.clip(p, 0.1, 0.9)
         return λ, η1, η2, p
 
-    def simulate_kou_paths(S0, vol, λ, η1, η2, p, T, n_paths=5000, n_steps=None, seed=42):
+    def simulate_kou_paths(S0, vol, λ, η1, η2, p, T, n_paths=5000, n_steps=None, seed=42, div_yield=0.0, risk_free=0.05):
         if n_steps is None:
-            n_steps = int(T * 252)
+            n_steps = max(int(T * 252), 10)
+        dt = T / n_steps
         np.random.seed(seed)
-        dt = 1/252
         if n_steps == 0:
             return np.full((n_paths, 1), S0)
         S = np.full((n_paths, n_steps+1), S0, dtype=np.float64)
         for t in range(1, n_steps+1):
             Z = np.random.randn(n_paths)
-            S[:, t] = S[:, t-1] * np.exp(-0.5 * vol**2 * dt + vol * np.sqrt(dt) * Z)
+            # Исправленный дрейф с учётом дивидендов
+            drift = (risk_free - div_yield - 0.5 * vol**2) * dt
+            S[:, t] = S[:, t-1] * np.exp(drift + vol * np.sqrt(dt) * Z)
             N = np.random.poisson(λ * dt, n_paths)
             total_jump = np.zeros(n_paths)
             for i in range(n_paths):
@@ -221,13 +290,13 @@ def calibrate_and_simulate(
         return S
 
     # ----------------------------
-    # Regime-Switching Heston
+    # Regime-Switching Heston (оставим без изменений, так как он внутренний)
     # ----------------------------
     def simulate_regime_switching_heston_paths(S0, T, n_paths=5000, n_steps=None, seed=42):
         if n_steps is None:
-            n_steps = int(T * 252)
+            n_steps = max(int(T * 252), 10)
+        dt = T / n_steps
         np.random.seed(seed)
-        dt = 1/252
         if n_steps == 0:
             return np.full((n_paths, 1), S0)
         params0 = [3.0, 0.02, 0.2, -0.3, 0.02]
@@ -236,7 +305,6 @@ def calibrate_and_simulate(
         S = np.full((n_paths, n_steps+1), S0, dtype=np.float64)
         v = np.full(n_paths, params0[4], dtype=np.float64)
         regime = np.zeros(n_paths, dtype=int)
-        sqrt_dt = np.sqrt(dt)
         for t in range(1, n_steps+1):
             rand = np.random.rand(n_paths)
             switch_to_1 = (regime == 0) & (rand < P[0,1])
@@ -249,9 +317,9 @@ def calibrate_and_simulate(
             rho = np.where(regime == 0, params0[3], params1[3])
             Z1 = np.random.randn(n_paths)
             Z2 = rho * Z1 + np.sqrt(1 - rho**2) * np.random.randn(n_paths)
-            v = np.maximum(v, 0.0)
-            S[:, t] = S[:, t-1] * np.exp(np.sqrt(v) * sqrt_dt * Z1 - 0.5 * v * dt)
-            v += kappa * (theta - v) * dt + xi * np.sqrt(v) * sqrt_dt * Z2
+            v_plus = np.maximum(v, 0.0)
+            S[:, t] = S[:, t-1] * np.exp(-0.5 * v_plus * dt + np.sqrt(v_plus * dt) * Z1)
+            v = v + kappa * (theta - v_plus) * dt + xi * np.sqrt(v_plus * dt) * Z2
         return np.maximum(S, 1e-8)
 
     # ----------------------------
@@ -262,7 +330,7 @@ def calibrate_and_simulate(
         if not (isinstance(params, np.ndarray) and params.shape == (5,)):
             params = np.array([2.0, 0.04, 0.3, -0.5, 0.04])
         kappa, theta, xi, rho, v0 = params
-        all_paths = simulate_heston_paths(current_price, kappa, theta, xi, rho, v0, T, n_paths=n_paths, n_steps=n_steps)
+        all_paths = simulate_heston_paths(current_price, kappa, theta, xi, rho, v0, T, n_paths=n_paths, n_steps=n_steps, div_yield=div_yield, risk_free=risk_free)
         model_desc = f"Heston (κ={kappa:.2f}, θ={theta:.4f}, ξ={xi:.2f}, ρ={rho:.2f})"
 
     elif model_choice == "SABR":
@@ -271,12 +339,12 @@ def calibrate_and_simulate(
         model_desc = f"SABR (α₀={alpha0:.3f}, β={beta:.1f}, ν={nu:.2f})"
 
     elif model_choice == "GBM (Baseline)":
-        all_paths = simulate_gbm_paths(current_price, sigma_hist, T, n_paths=n_paths, n_steps=n_steps)
+        all_paths = simulate_gbm_paths(current_price, sigma_hist, T, n_paths=n_paths, n_steps=n_steps, div_yield=div_yield, risk_free=risk_free)
         model_desc = f"GBM (σ={sigma_hist:.2%})"
 
     elif model_choice == "Double Exp Jump-Diffusion":
         λ, η1, η2, p = calibrate_kou(log_returns)
-        all_paths = simulate_kou_paths(current_price, sigma_hist, λ, η1, η2, p, T, n_paths=n_paths, n_steps=n_steps)
+        all_paths = simulate_kou_paths(current_price, sigma_hist, λ, η1, η2, p, T, n_paths=n_paths, n_steps=n_steps, div_yield=div_yield, risk_free=risk_free)
         model_desc = f"Kou Jump (λ={λ:.2f}, η₁={η1:.1f}, η₂={η2:.1f}, p={p:.2f})"
 
     elif model_choice == "Regime-Switching Heston":
@@ -284,11 +352,12 @@ def calibrate_and_simulate(
         model_desc = "Regime-Switching Heston (Calm ↔ Crisis)"
 
     else:
-        all_paths = simulate_gbm_paths(current_price, sigma_hist, T, n_paths=n_paths, n_steps=n_steps)
+        all_paths = simulate_gbm_paths(current_price, sigma_hist, T, n_paths=n_paths, n_steps=n_steps, div_yield=div_yield, risk_free=risk_free)
         model_desc = "Fallback GBM"
 
     future_prices = all_paths[:, -1]
-    future_prices = future_prices[np.isfinite(future_prices)]
+    # Защита от численных ошибок
+    future_prices = future_prices[np.isfinite(future_prices) & (future_prices > 0)]
     if len(future_prices) == 0:
         return None, None, None, None, "Simulation produced no valid prices"
 
@@ -371,14 +440,16 @@ if run_button:
                         if target_price <= 0:
                             st.warning("Target price must be positive.")
                         else:
-                            prob_above = np.mean(future_prices >= target_price)
-                            prob_below = 1 - prob_above
-                            st.info(f"🎯 Probability that **{ticker_input} ≥ ${target_price:.2f}** in {forecast_days} days: **{prob_above:.1%}**")
+                            count_target = np.sum(future_prices >= target_price)
+                            nobs = len(future_prices)
+                            prob_above = count_target / nobs if nobs > 0 else 0.0
+                            ci_low, ci_up = wilson_confidence_interval(count_target, nobs)
+                            st.info(f"🎯 Probability that **{ticker_input} ≥ ${target_price:.2f}** in {forecast_days} days: **{prob_above:.1%}** (95% CI: {ci_low:.1%}–{ci_up:.1%})")
                     except ValueError:
                         st.warning("Invalid target price. Please enter a number.")
 
                 # ----------------------------
-                # Compute base probabilities and expected return
+                # Compute base probabilities with CIs
                 # ----------------------------
                 p0 = current_price
                 p_up5 = p0 * 1.05
@@ -386,16 +457,33 @@ if run_button:
                 p_down5 = p0 * 0.95
                 p_down10 = p0 * 0.90
 
-                prob_up_0_5 = np.mean((future_prices > p0) & (future_prices <= p_up5))
-                prob_up_5_10 = np.mean((future_prices > p_up5) & (future_prices <= p_up10))
-                prob_down_0_5 = np.mean((future_prices >= p_down5) & (future_prices < p0))
-                prob_down_5_10 = np.mean((future_prices >= p_down10) & (future_prices < p_down5))
-                prob_extreme = np.mean((future_prices > p_up10) | (future_prices < p_down10))
-                down_0_10 = prob_down_0_5 + prob_down_5_10
+                nobs = len(future_prices)
+                # Up 0-5%
+                count_up_0_5 = np.sum((future_prices > p0) & (future_prices <= p_up5))
+                prob_up_0_5 = count_up_0_5 / nobs if nobs > 0 else 0.0
+                ci_up_0_5_low, ci_up_0_5_up = wilson_confidence_interval(count_up_0_5, nobs)
 
-                # Ожидаемая доходность
-                expected_price = np.mean(future_prices)
-                expected_return_pct = (expected_price / current_price - 1) * 100
+                # Up 5-10%
+                count_up_5_10 = np.sum((future_prices > p_up5) & (future_prices <= p_up10))
+                prob_up_5_10 = count_up_5_10 / nobs if nobs > 0 else 0.0
+                ci_up_5_10_low, ci_up_5_10_up = wilson_confidence_interval(count_up_5_10, nobs)
+
+                # Down 0-5%
+                count_down_0_5 = np.sum((future_prices >= p_down5) & (future_prices < p0))
+                prob_down_0_5 = count_down_0_5 / nobs if nobs > 0 else 0.0
+                ci_down_0_5_low, ci_down_0_5_up = wilson_confidence_interval(count_down_0_5, nobs)
+
+                # Down 5-10%
+                count_down_5_10 = np.sum((future_prices >= p_down10) & (future_prices < p_down5))
+                prob_down_5_10 = count_down_5_10 / nobs if nobs > 0 else 0.0
+                ci_down_5_10_low, ci_down_5_10_up = wilson_confidence_interval(count_down_5_10, nobs)
+
+                # Extreme
+                count_extreme = np.sum((future_prices > p_up10) | (future_prices < p_down10))
+                prob_extreme = count_extreme / nobs if nobs > 0 else 0.0
+                ci_extreme_low, ci_extreme_up = wilson_confidence_interval(count_extreme, nobs)
+
+                down_0_10 = prob_down_0_5 + prob_down_5_10
 
                 # ----------------------------
                 # Find representative paths
@@ -421,10 +509,14 @@ if run_button:
                 # ----------------------------
                 st.subheader(f"Current price: ${current_price:.2f}")
                 st.write(f"**{forecast_days}-day outlook for {name_or_error} ({ticker_input}) using {model_choice}:**")
-                st.write(f"- 📈 {prob_up_0_5:.0%} chance: +0% to +5%")
-                st.write(f"- 📈 {prob_up_5_10:.0%} chance: +5% to +10%")
+                st.write(f"- 📈 {prob_up_0_5:.0%} (95% CI: {ci_up_0_5_low:.0%}–{ci_up_0_5_up:.0%}) chance: +0% to +5%")
+                st.write(f"- 📈 {prob_up_5_10:.0%} (95% CI: {ci_up_5_10_low:.0%}–{ci_up_5_10_up:.0%}) chance: +5% to +10%")
                 st.write(f"- 📉 {down_0_10:.0%} chance: down to -10%")
-                st.write(f"- ⚠️ {prob_extreme:.0%} chance: extreme move (>±10%)")
+                st.write(f"- ⚠️ {prob_extreme:.0%} (95% CI: {ci_extreme_low:.0%}–{ci_extreme_up:.0%}) chance: extreme move (>±10%)")
+                
+                # Ожидаемая доходность
+                expected_price = np.mean(future_prices)
+                expected_return_pct = (expected_price / current_price - 1) * 100
                 st.write(f"- 💡 **Expected return: {expected_return_pct:+.2f}%** in {forecast_days} days")
 
                 # Plot 1: Distribution
@@ -463,6 +555,264 @@ if run_button:
                 st.pyplot(fig2)
 
                 st.caption(f"Model: {model_desc} | Calibration: 2-year historical data | Paths: 5,000")
+
+                # ----------------------------
+                # 🔍 Bayesian Signal Analysis (Experimental)
+                # ----------------------------
+                try:
+                    # Используем уже загруженные данные
+                    full_data = fetch_stock_data(ticker_input)
+                    prices_for_ta = full_data['Close'].dropna()
+                    volumes = full_data.get('Volume', pd.Series()).dropna()
+
+                    if len(prices_for_ta) >= 50:
+                        # SMA
+                        sma20 = prices_for_ta.rolling(window=20).mean()
+                        sma50 = prices_for_ta.rolling(window=50).mean()
+                        current_sma20 = sma20.iloc[-1]
+                        current_sma50 = sma50.iloc[-1]
+                        signal_sma = 1 if (current_price > current_sma20) and (current_sma20 > current_sma50) else 0
+                    else:
+                        signal_sma = None
+
+                    if len(prices_for_ta) >= 15:
+                        rsi_series = compute_rsi(prices_for_ta, window=14)
+                        current_rsi = rsi_series.iloc[-1]
+                        signal_rsi = 1 if current_rsi < 40 else 0
+                    else:
+                        signal_rsi = None
+
+                    signal_volume = None
+                    if len(volumes) >= 20 and volumes.iloc[-1] > 0:
+                        avg_vol_20 = volumes.tail(21).iloc[:-1].mean()  # последние 20 дней, исключая сегодня
+                        current_vol = volumes.iloc[-1]
+                        signal_volume = 1 if current_vol > avg_vol_20 else 0
+
+                    # Априорная вероятность роста
+                    P_up_prior = np.mean(future_prices > current_price)
+                    P_up_posterior = P_up_prior
+
+                    # Чувствительности
+                    sens_sma = 0.55
+                    sens_rsi = 0.52
+                    sens_volume = 0.51
+
+                    # Последовательное обновление
+                    if signal_sma == 1:
+                        P_up_posterior = (sens_sma * P_up_posterior) / (sens_sma * P_up_posterior + (1 - sens_sma) * (1 - P_up_posterior))
+                    if signal_rsi == 1:
+                        P_up_posterior = (sens_rsi * P_up_posterior) / (sens_rsi * P_up_posterior + (1 - sens_rsi) * (1 - P_up_posterior))
+                    if signal_volume == 1:
+                        P_up_posterior = (sens_volume * P_up_posterior) / (sens_volume * P_up_posterior + (1 - sens_volume) * (1 - P_up_posterior))
+
+                    # Ограничение
+                    P_up_posterior = np.clip(P_up_posterior, 0.01, 0.99)
+
+                    # Отображение
+                    with st.expander("🔍 Bayesian Signal Analysis (Experimental)"):
+                        st.markdown("#### Technical Signal Assessment")
+                        
+                        signals_info = []
+                        if signal_sma is not None:
+                            sma_status = "✅ Bullish Trend (Price > SMA20 > SMA50)" if signal_sma else "❌ No Bullish Trend"
+                            signals_info.append(("SMA(20/50)", sma_status))
+                        if signal_rsi is not None:
+                            rsi_status = "✅ Oversold (RSI < 40)" if signal_rsi else "❌ Not Oversold (RSI ≥ 40)"
+                            signals_info.append(("RSI(14)", rsi_status))
+                        if signal_volume is not None:
+                            vol_status = "✅ Above Avg Volume" if signal_volume else "❌ Below Avg Volume"
+                            signals_info.append(("Volume", vol_status))
+                        
+                        if signals_info:
+                            for signal_name, status in signals_info:
+                                st.write(f"- **{signal_name}**: {status}")
+                        else:
+                            st.write("Not enough data for signal analysis.")
+
+                        st.write(f"- **Prior probability of upside**: {P_up_prior:.1%}")
+                        st.write(f"- **Posterior probability of upside**: {P_up_posterior:.1%}")
+
+                        st.warning(
+                            "⚠️ **This is a hypothetical calculation. Signals are NOT used in the main stochastic model. "
+                            "Not a recommendation.**"
+                        )
+                        st.caption(
+                            "*Based on simplified Bayesian updating with heuristic signal sensitivities. For research only.*"
+                        )
+                except Exception as e:
+                    # Молча пропускаем, если что-то пошло не так
+                    pass
+
+                # ----------------------------
+                # 📊 Delta-Neutral Portfolio Builder (Options Hedging)
+                # ----------------------------
+                with st.expander("📊 Delta-Neutral Portfolio Builder (Options Hedging)"):
+                    opt_type = st.selectbox("Option type", ["Call", "Put"], key="opt_type")
+                    strike = st.number_input("Strike price ($)", value=float(current_price), min_value=0.01, key="strike")
+                    opt_days = st.number_input("Days to expiry", min_value=1, max_value=60, value=forecast_days, key="opt_days")
+                    contracts = st.number_input("Number of contracts", min_value=1, max_value=1000, value=1, key="contracts")
+                    hedge_button = st.button("🔍 Calculate & Build Hedge")
+
+                    if hedge_button:
+                        try:
+                            # Получаем дивидендную доходность и безрисковую ставку
+                            try:
+                                ticker_info = yf.Ticker(ticker_input).info
+                                div_yield = ticker_info.get('dividendYield', 0.0)
+                                if not isinstance(div_yield, (int, float)) or div_yield is None:
+                                    div_yield = 0.0
+                                div_yield = float(div_yield)
+                            except:
+                                div_yield = 0.0
+                            risk_free = 0.05
+
+                            # Получаем исторические данные
+                            data = fetch_stock_data(ticker_input)
+                            close_prices = data['Close'].dropna()
+                            if len(close_prices) < 60:
+                                raise ValueError("Not enough historical data for hedging calculation.")
+
+                            # Подготавливаем данные для калибровки
+                            log_prices = np.log(close_prices.values)
+                            log_returns = np.diff(log_prices)
+                            log_returns = log_returns[np.isfinite(log_returns)]
+                            sigma_hist = float(np.std(log_returns) * np.sqrt(252)) if len(log_returns) >= 20 else 0.2
+                            if len(log_returns) >= 30:
+                                realized_vol = np.std(log_returns[-30:]) * np.sqrt(252)
+                                sigma_hist = 0.7 * sigma_hist + 0.3 * realized_vol
+
+                            T_opt = opt_days / 252.0
+                            n_steps_opt = max(opt_days, 10)
+                            dt_opt = T_opt / n_steps_opt
+
+                            # Выбираем функцию симуляции на основе модели
+                            if model_choice == "Heston":
+                                params = calibrate_heston(log_returns)
+                                if not (isinstance(params, np.ndarray) and params.shape == (5,)):
+                                    params = np.array([2.0, 0.04, 0.3, -0.5, 0.04])
+                                kappa, theta, xi, rho, v0 = params
+                                def sim_func(S0):
+                                    return simulate_heston_paths(S0, kappa, theta, xi, rho, v0, T_opt, n_paths=3000, n_steps=n_steps_opt, div_yield=div_yield, risk_free=risk_free)
+                            elif model_choice == "SABR":
+                                alpha0, beta, nu = calibrate_sabr(log_returns, current_price)
+                                def sim_func(S0):
+                                    return simulate_sabr_paths(S0, alpha0, beta, nu, T_opt, n_paths=3000, n_steps=n_steps_opt)
+                            elif model_choice == "Double Exp Jump-Diffusion":
+                                λ, η1, η2, p = calibrate_kou(log_returns)
+                                def sim_func(S0):
+                                    return simulate_kou_paths(S0, sigma_hist, λ, η1, η2, p, T_opt, n_paths=3000, n_steps=n_steps_opt, div_yield=div_yield, risk_free=risk_free)
+                            elif model_choice == "Regime-Switching Heston":
+                                def sim_func(S0):
+                                    return simulate_regime_switching_heston_paths(S0, T_opt, n_paths=3000, n_steps=n_steps_opt)
+                            else:  # GBM or fallback
+                                def sim_func(S0):
+                                    return simulate_gbm_paths(S0, sigma_hist, T_opt, n_paths=3000, n_steps=n_steps_opt, div_yield=div_yield, risk_free=risk_free)
+
+                            # Симуляция для текущей цены
+                            paths_S = sim_func(current_price)
+                            ST_S = paths_S[:, -1]
+                            ST_S = ST_S[np.isfinite(ST_S) & (ST_S > 0)]
+                            if len(ST_S) == 0:
+                                raise ValueError("Simulation failed for base price.")
+
+                            # Payoff и цена опциона
+                            if opt_type == "Call":
+                                payoff_S = np.maximum(ST_S - strike, 0.0)
+                            else:
+                                payoff_S = np.maximum(strike - ST_S, 0.0)
+                            option_price = np.exp(-risk_free * T_opt) * np.mean(payoff_S)
+
+                            # Численная дельта: S_up = S * 1.01
+                            S_up = current_price * 1.01
+                            # Подменяем последнюю цену в исторических данных
+                            close_prices_up = close_prices.copy()
+                            close_prices_up.iloc[-1] = S_up
+                            log_prices_up = np.log(close_prices_up.values)
+                            log_returns_up = np.diff(log_prices_up)
+                            log_returns_up = log_returns_up[np.isfinite(log_returns_up)]
+                            sigma_hist_up = float(np.std(log_returns_up) * np.sqrt(252)) if len(log_returns_up) >= 20 else 0.2
+                            if len(log_returns_up) >= 30:
+                                realized_vol_up = np.std(log_returns_up[-30:]) * np.sqrt(252)
+                                sigma_hist_up = 0.7 * sigma_hist_up + 0.3 * realized_vol_up
+
+                            # Обновляем функцию симуляции для GBM/SABR/Jump с новой волатильностью
+                            if model_choice == "Heston":
+                                params_up = calibrate_heston(log_returns_up)
+                                if not (isinstance(params_up, np.ndarray) and params_up.shape == (5,)):
+                                    params_up = np.array([2.0, 0.04, 0.3, -0.5, 0.04])
+                                kappa_up, theta_up, xi_up, rho_up, v0_up = params_up
+                                def sim_func_up(S0):
+                                    return simulate_heston_paths(S0, kappa_up, theta_up, xi_up, rho_up, v0_up, T_opt, n_paths=2000, n_steps=n_steps_opt, div_yield=div_yield, risk_free=risk_free)
+                            elif model_choice == "SABR":
+                                alpha0_up, beta_up, nu_up = calibrate_sabr(log_returns_up, S_up)
+                                def sim_func_up(S0):
+                                    return simulate_sabr_paths(S0, alpha0_up, beta_up, nu_up, T_opt, n_paths=2000, n_steps=n_steps_opt)
+                            elif model_choice == "Double Exp Jump-Diffusion":
+                                λ_up, η1_up, η2_up, p_up = calibrate_kou(log_returns_up)
+                                def sim_func_up(S0):
+                                    return simulate_kou_paths(S0, sigma_hist_up, λ_up, η1_up, η2_up, p_up, T_opt, n_paths=2000, n_steps=n_steps_opt, div_yield=div_yield, risk_free=risk_free)
+                            elif model_choice == "Regime-Switching Heston":
+                                def sim_func_up(S0):
+                                    return simulate_regime_switching_heston_paths(S0, T_opt, n_paths=2000, n_steps=n_steps_opt)
+                            else:  # GBM
+                                def sim_func_up(S0):
+                                    return simulate_gbm_paths(S0, sigma_hist_up, T_opt, n_paths=2000, n_steps=n_steps_opt, div_yield=div_yield, risk_free=risk_free)
+
+                            # Симуляция для S_up
+                            paths_S_up = sim_func_up(S_up)
+                            ST_S_up = paths_S_up[:, -1]
+                            ST_S_up = ST_S_up[np.isfinite(ST_S_up) & (ST_S_up > 0)]
+                            if len(ST_S_up) == 0:
+                                raise ValueError("Simulation failed for bumped price.")
+
+                            if opt_type == "Call":
+                                payoff_S_up = np.maximum(ST_S_up - strike, 0.0)
+                            else:
+                                payoff_S_up = np.maximum(strike - ST_S_up, 0.0)
+                            option_price_up = np.exp(-risk_free * T_opt) * np.mean(payoff_S_up)
+
+                            # Дельта
+                            delta = (option_price_up - option_price) / (current_price * 0.01)
+                            delta = np.clip(delta, -1.0, 1.0)
+
+                            # Хеджирующая позиция
+                            shares_to_hedge = -delta * contracts * 100
+
+                            # Вывод результатов
+                            st.write(f"**Option Price**: ${option_price:.4f}")
+                            st.write(f"**Delta**: {delta:.4f}")
+                            action = "Sell" if shares_to_hedge < 0 else "Buy"
+                            st.write(f"**Hedge Action**: {action} {abs(shares_to_hedge):.0f} shares")
+
+                            # P&L анализ
+                            # Используем те же пути ST_S для unhedged
+                            unhedged_pnl = (payoff_S - option_price) * contracts * 100
+                            # Для хеджированного портфеля: нужно знать изменение цены акции за opt_days
+                            # Используем ST_S как будущие цены акции
+                            hedged_pnl = unhedged_pnl + (ST_S - current_price) * shares_to_hedge
+
+                            std_unhedged = np.std(unhedged_pnl)
+                            std_hedged = np.std(hedged_pnl)
+                            risk_reduction = (1 - std_hedged / std_unhedged) * 100 if std_unhedged > 0 else 0.0
+
+                            st.write(f"**P&L Risk (Std Dev)**: Unhedged = ${std_unhedged:.2f}, Hedged = ${std_hedged:.2f}")
+                            st.write(f"**Risk Reduction**: {risk_reduction:.1f}%")
+
+                            # Гистограмма P&L
+                            fig_pnl, ax_pnl = plt.subplots(figsize=(8, 3.5))
+                            ax_pnl.hist(unhedged_pnl, bins=80, alpha=0.6, color='orange', label='Unhedged Option', density=True)
+                            ax_pnl.hist(hedged_pnl, bins=80, alpha=0.6, color='green', label='Delta-Neutral Portfolio', density=True)
+                            ax_pnl.set_xlabel('P&L ($)')
+                            ax_pnl.set_ylabel('Density')
+                            ax_pnl.set_title('Profit & Loss Distribution')
+                            ax_pnl.legend()
+                            ax_pnl.grid(True, linestyle='--', alpha=0.5)
+                            st.pyplot(fig_pnl)
+
+                            st.caption("⚠️ This is a simplified delta hedge. Real-world hedging requires continuous rebalancing and accounts for transaction costs.")
+
+                        except Exception as e:
+                            st.error(f"Hedge calculation failed: {str(e)}")
 
                 # ----------------------------
                 # Сравнение с SPY (если выбрано)
