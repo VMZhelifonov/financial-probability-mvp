@@ -676,10 +676,16 @@ if run_button:
                 # ----------------------------
                 # Экспорт в CSV
                 # ----------------------------
+                                # ----------------------------
+                # Экспорт в CSV
+                # ----------------------------
                 st.markdown("---")
                 st.subheader("📥 Export Forecast Data")
-                # Создаём DataFrame: каждая строка — один сценарий, столбцы — дни (0 = сегодня, 1...forecast_days)
-                df_export = pd.DataFrame(all_paths)
+                # Создаём DataFrame: каждая строка — один сценарий.
+                # Берём только первые (forecast_days + 1) точек из траектории,
+                # чтобы соответствовать горизонту прогноза (0 = сегодня, 1...forecast_days).
+                paths_to_export = all_paths[:, :forecast_days + 1]
+                df_export = pd.DataFrame(paths_to_export)
                 df_export.columns = [f"Day_{i}" for i in range(forecast_days + 1)]
                 csv_buffer = io.StringIO()
                 df_export.to_csv(csv_buffer, index=False)
@@ -691,7 +697,7 @@ if run_button:
                     file_name=f"{ticker_input}_forecast_{forecast_days}d.csv",
                     mime="text/csv"
                 )
-
 else:
     st.info("👆 Adjust parameters and click **'Run Forecast'** to start.")
+
 
