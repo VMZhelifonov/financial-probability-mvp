@@ -540,12 +540,13 @@ if run_button:
                 days_forecast = np.arange(1, forecast_days + 1)
 
                 fig2, ax2 = plt.subplots(figsize=(8, 4))
+                
                 ax2.plot(days_hist, last_7_days.values, 'o-', color='black', label='Last 7 Days', linewidth=2, markersize=4)
-                ax2.plot(days_forecast, path_up_5_10[1:], 'o--', color='green', label='+5% to +10%', linewidth=2, markersize=4)
-                ax2.plot(days_forecast, path_up_0_5[1:], 'o--', color='blue', label='+0% to +5%', linewidth=2, markersize=4)
-                ax2.plot(days_forecast, path_down_0_5[1:], 'o--', color='orange', label='-5% to 0%', linewidth=2, markersize=4)
-                ax2.plot(days_forecast, path_down_5_10[1:], 'o--', color='red', label='-10% to -5%', linewidth=2, markersize=4)
-
+                ax2.plot(days_forecast, path_up_5_10[1:forecast_days+1], 'o--', color='green', label='+5% to +10%', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_up_0_5[1:forecast_days+1], 'o--', color='blue', label='+0% to +5%', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_down_0_5[1:forecast_days+1], 'o--', color='orange', label='-5% to 0%', linewidth=2, markersize=4)
+                ax2.plot(days_forecast, path_down_5_10[1:forecast_days+1], 'o--', color='red', label='-10% to -5%', linewidth=2, markersize=4)
+                
                 ax2.set_xlabel('Days (0 = today)')
                 ax2.set_ylabel('Price ($)')
                 ax2.set_title('Scenario Paths (Next {} Days)'.format(forecast_days))
@@ -693,3 +694,4 @@ if run_button:
 
 else:
     st.info("👆 Adjust parameters and click **'Run Forecast'** to start.")
+
