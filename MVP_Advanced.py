@@ -677,6 +677,221 @@ if run_button:
                         )
 
                 # ----------------------------
+                # 📊 Delta-Neutral Portfolio Builder (Options Hedging)
+                # ----------------------------
+                with st.expander("📊 Delta-Neutral Portfolio Builder (Options Hedging)"):
+                    opt_type = st.selectbox("Option type", ["Call", "Put"], key="opt_type")
+                    strike = st.number_input("Strike price ($)", value=float(current_price), min_value=0.01, key="strike")
+                    opt_days = st.number_input("Days to expiry", min_value=1, max_value=60, value=forecast_days, key="opt_days")
+                    contracts = st.number_input("Number of contracts", min_value=1, max_value=1000, value=1, key="contracts")
+                    calc_button = st.button("🔍 Calculate & Build Hedge")
+
+                    if calc_button:
+                        try:
+                            # Извлекаем исторические данные и параметры
+                            data = fetch_stock_data(ticker_input)
+                            close_prices = data['Close'].dropna()
+                            current_price_local = float(close_prices.iloc[-1])
+                            
+                            # Получаем лог-доходности и волатильность как в основном коде
+                            log_prices = np.log(close_prices.values)
+                            log_returns = np.diff(log_prices)
+                            log_returns = log_returns[np.isfinite(log_returns)]
+                            sigma_hist = float(np.std(log_returns) * np.sqrt(252)) if len(log_returns) >= 20 else 0.2
+                            if len(log_returns) >= 30:
+                                realized_vol = np.std(log_returns[-30:]) * np.sqrt(252)
+                                sigma_hist = 0.7 * sigma_hist + 0.3 * realized_vol
+
+                            # Получаем дивидендную доходность
+                            try:
+                                ticker_info = yf.Ticker(ticker_input).info
+                                div_yield = ticker_info.get('dividendYield', 0.0)
+                                if not isinstance(div_yield, (int, float)) or div_yield is None:
+                                    div_yield = 0.0
+                                div_yield = float(div_yield)
+                            except:
+                                div_yield = 0.0
+
+                            risk_free = 0.05
+                            T_opt = opt_days / 252.0
+                            n_steps_opt = max(opt_days, 10)
+
+                            # Вспомогательные функции из calibrate_and_simulate
+                            def simulate_gbm_paths_local(S0, vol, T, n_paths=5000, n_steps=None, seed=42, div_yield=0.0, risk_free=0.05):
+                                if n_steps is None:
+                                    n_steps = max(int(T * 252), 10)
+                                dt = T / n_steps
+                                np.random.seed(seed)
+                                if n_steps == 0:
+                                    return np.full((n_paths, 1), S0)
+                                Z = np.random.randn(n_paths, n_steps)
+                                drift = (risk_free - div_yield - 0.5 * vol**2) * dt
+                                diffusion = vol * np.sqrt(dt) * Z
+                                logS = np.log(S0) + np.cumsum(drift + diffusion, axis=1)
+                                S = np.exp(np.hstack([np.full((n_paths, 1), S0), logS]))
+                                return np.maximum(S, 1e-8)
+
+                            def simulate_heston_paths_local(S0, kappa, theta, xi, rho, v0, T, n_paths=5000, n_steps=None, seed=42, div_yield=0.0, risk_free=0.05):
+                                if n_steps is None:
+                                    n_steps = max(int(T * 252), 10)
+                                dt = T / n_steps
+                                np.random.seed(seed)
+                                if n_steps == 0:
+                                    return np.full((n_paths, 1), S0)
+                                S = np.full((n_paths, n_steps+1), S0, dtype=np.float64)
+                                v = np.full(n_paths, v0, dtype=np.float64)
+                                for t in range(1, n_steps+1):
+                                    Z1 = np.random.randn(n_paths)
+                                    Z2 = rho * Z1 + np.sqrt(1 - rho**2) * np.random.randn(n_paths)
+                                    v_plus = np.maximum(v, 0.0)
+                                    drift = (risk_free - div_yield - 0.5 * v_plus) * dt
+                                    diffusion = np.sqrt(v_plus * dt) * Z1
+                                    S[:, t] = S[:, t-1] * np.exp(drift + diffusion)
+                                    v = v + kappa * (theta - v_plus) * dt + xi * np.sqrt(v_plus * dt) * Z2
+                                return np.maximum(S, 1e-8)
+
+                            # Определяем модель и параметры для симуляции
+                            model_used = model_choice
+                            if model_used == "Heston":
+                                # Калибруем Heston заново для текущих данных
+                                def calibrate_heston_local(log_returns):
+                                    if len(log_returns) < 20:
+                                        return np.array([2.0, 0.04, 0.3, -0.5, 0.04])
+                                    log_returns = log_returns[np.isfinite(log_returns)]
+                                    if len(log_returns) < 20:
+                                        return np.array([2.0, 0.04, 0.3, -0.5, 0.04])
+                                    try:
+                                        daily_var = np.var(log_returns)
+                                        hist_var = daily_var * 252 if daily_var > 1e-8 else 0.04
+                                        hist_var = np.clip(hist_var, 1e-4, 1.0)
+                                        kurt_hist = ((np.mean((log_returns - np.mean(log_returns))**4) / (daily_var**2)) - 3) if daily_var > 1e-8 else 0.0
+                                        kurt_hist = np.clip(kurt_hist, 0.0, 20.0)
+                                    except:
+                                        hist_var = 0.04
+                                        kurt_hist = 3.0
+                                    x0 = np.array([2.0, hist_var, 0.3, -0.5, hist_var], dtype=np.float64)
+                                    def loss(params):
+                                        kappa, theta, xi, rho, v0 = params
+                                        if not (0.1 <= kappa <= 20 and 1e-4 <= theta <= 1.0 and 0.01 <= xi <= 2.0 and -0.99 <= rho <= -0.01 and 1e-4 <= v0 <= 1.0):
+                                            return 1e6
+                                        try:
+                                            kurt_model = 3 * xi**2 / (kappa * theta + 1e-8)
+                                            return (theta - hist_var)**2 + (kurt_model - kurt_hist)**2
+                                        except:
+                                            return 1e6
+                                    try:
+                                        res = minimize(loss, x0, method='L-BFGS-B',
+                                                       bounds=[(0.1, 20), (1e-4, 1.0), (0.01, 2.0), (-0.99, -0.01), (1e-4, 1.0)],
+                                                       options={'maxiter': 100})
+                                        if res.success and np.all(np.isfinite(res.x)):
+                                            return np.array(res.x, dtype=np.float64)
+                                        else:
+                                            return x0
+                                    except:
+                                        return x0
+                                params = calibrate_heston_local(log_returns)
+                                if not (isinstance(params, np.ndarray) and params.shape == (5,)):
+                                    params = np.array([2.0, 0.04, 0.3, -0.5, 0.04])
+                                kappa, theta, xi, rho, v0 = params
+
+                            # Симуляция для текущей цены (3000 путей)
+                            if model_used == "Heston":
+                                paths_base = simulate_heston_paths_local(
+                                    current_price_local, kappa, theta, xi, rho, v0, T_opt,
+                                    n_paths=3000, n_steps=n_steps_opt, div_yield=div_yield, risk_free=risk_free
+                                )
+                            else:
+                                paths_base = simulate_gbm_paths_local(
+                                    current_price_local, sigma_hist, T_opt,
+                                    n_paths=3000, n_steps=n_steps_opt, div_yield=div_yield, risk_free=risk_free
+                                )
+                            S_T_base = paths_base[:, -1]
+                            S_T_base = S_T_base[np.isfinite(S_T_base) & (S_T_base > 0)]
+                            if len(S_T_base) == 0:
+                                raise ValueError("No valid simulated prices for base scenario")
+
+                            # Расчёт payoff и цены опциона
+                            if opt_type == "Call":
+                                payoff_base = np.maximum(S_T_base - strike, 0.0)
+                            else:  # Put
+                                payoff_base = np.maximum(strike - S_T_base, 0.0)
+                            option_price = np.exp(-risk_free * T_opt) * np.mean(payoff_base)
+
+                            # Численная дельта: сдвиг на 1%
+                            S_up = current_price_local * 1.01
+                            close_prices_up = close_prices.copy()
+                            close_prices_up.iloc[-1] = S_up
+                            log_prices_up = np.log(close_prices_up.values)
+                            log_returns_up = np.diff(log_prices_up)
+                            log_returns_up = log_returns_up[np.isfinite(log_returns_up)]
+                            sigma_hist_up = float(np.std(log_returns_up) * np.sqrt(252)) if len(log_returns_up) >= 20 else 0.2
+                            if len(log_returns_up) >= 30:
+                                realized_vol_up = np.std(log_returns_up[-30:]) * np.sqrt(252)
+                                sigma_hist_up = 0.7 * sigma_hist_up + 0.3 * realized_vol_up
+
+                            # Симуляция для S_up (2000 путей, seed=42)
+                            if model_used == "Heston":
+                                paths_up = simulate_heston_paths_local(
+                                    S_up, kappa, theta, xi, rho, v0, T_opt,
+                                    n_paths=2000, n_steps=n_steps_opt, seed=42, div_yield=div_yield, risk_free=risk_free
+                                )
+                            else:
+                                paths_up = simulate_gbm_paths_local(
+                                    S_up, sigma_hist_up, T_opt,
+                                    n_paths=2000, n_steps=n_steps_opt, seed=42, div_yield=div_yield, risk_free=risk_free
+                                )
+                            S_T_up = paths_up[:, -1]
+                            S_T_up = S_T_up[np.isfinite(S_T_up) & (S_T_up > 0)]
+                            if len(S_T_up) == 0:
+                                raise ValueError("No valid simulated prices for up scenario")
+
+                            if opt_type == "Call":
+                                payoff_up = np.maximum(S_T_up - strike, 0.0)
+                            else:
+                                payoff_up = np.maximum(strike - S_T_up, 0.0)
+                            option_price_up = np.exp(-risk_free * T_opt) * np.mean(payoff_up)
+
+                            delta = (option_price_up - option_price) / (current_price_local * 0.01)
+                            delta = np.clip(delta, -1.0, 1.0)
+
+                            shares_to_hedge = -delta * contracts * 100
+
+                            # Вывод результатов
+                            st.write(f"**Option Price**: ${option_price:.4f}")
+                            st.write(f"**Delta**: {delta:.4f}")
+                            action = "Sell" if shares_to_hedge < 0 else "Buy"
+                            st.write(f"**Hedge Action**: {action} {abs(shares_to_hedge):.0f} shares")
+
+                            # Расчёт P&L
+                            unhedged_pnl = (payoff_base - option_price) * contracts * 100
+                            price_change = S_T_base - current_price_local
+                            hedged_pnl = unhedged_pnl + price_change * shares_to_hedge
+
+                            std_unhedged = np.std(unhedged_pnl)
+                            std_hedged = np.std(hedged_pnl)
+                            risk_reduction_pct = (1 - std_hedged / std_unhedged) * 100 if std_unhedged > 0 else 0.0
+
+                            st.write(f"**P&L Std (Unhedged)**: ${std_unhedged:.2f}")
+                            st.write(f"**P&L Std (Delta-Neutral)**: ${std_hedged:.2f}")
+                            st.write(f"**Risk Reduction**: {risk_reduction_pct:.1f}%")
+
+                            # Гистограмма P&L
+                            fig_pnl, ax_pnl = plt.subplots(figsize=(8, 4))
+                            ax_pnl.hist(unhedged_pnl, bins=100, alpha=0.6, color='orange', label='Unhedged Option', density=True)
+                            ax_pnl.hist(hedged_pnl, bins=100, alpha=0.6, color='green', label='Delta-Neutral Portfolio', density=True)
+                            ax_pnl.set_xlabel('P&L ($)')
+                            ax_pnl.set_ylabel('Density')
+                            ax_pnl.set_title('P&L Distribution: Unhedged vs Delta-Neutral')
+                            ax_pnl.legend()
+                            ax_pnl.grid(True, linestyle='--', alpha=0.5)
+                            st.pyplot(fig_pnl)
+
+                            st.caption("⚠️ This is a simplified delta hedge. Real-world hedging requires continuous rebalancing and accounts for transaction costs.")
+
+                        except Exception as e:
+                            st.error(f"Hedge calculation failed: {str(e)}")
+
+                # ----------------------------
                 # Сравнение с SPY (если выбрано)
                 # ----------------------------
                 if compare_with_spy:
