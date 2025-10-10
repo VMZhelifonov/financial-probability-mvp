@@ -461,6 +461,10 @@ st.markdown("""
 ⚠️ **Not financial advice. For educational/research purposes only.**
 """)
 
+# Initialize session state to persist forecast results
+if "forecast_run" not in st.session_state:
+    st.session_state.forecast_run = False
+
 ticker_input = st.text_input("Enter stock ticker (e.g. AAPL, TSLA, MSFT)", value="AAPL").upper().strip()
 forecast_days = st.slider("Forecast horizon (days)", min_value=1, max_value=30, value=5)
 model_choice = st.selectbox("Stochastic model", [
@@ -478,6 +482,21 @@ compare_with_spy = st.checkbox("📊 Compare with S&P 500 (SPY)")
 run_button = st.button("🚀 Run Forecast")
 
 if run_button:
+    st.session_state.forecast_run = True
+    st.session_state.ticker_input = ticker_input
+    st.session_state.forecast_days = forecast_days
+    st.session_state.model_choice = model_choice
+    st.session_state.target_price_input = target_price_input
+    st.session_state.compare_with_spy = compare_with_spy
+
+if st.session_state.forecast_run:
+    # Restore inputs from session state
+    ticker_input = st.session_state.ticker_input
+    forecast_days = st.session_state.forecast_days
+    model_choice = st.session_state.model_choice
+    target_price_input = st.session_state.target_price_input
+    compare_with_spy = st.session_state.compare_with_spy
+
     if not ticker_input:
         st.warning("Please enter a stock ticker.")
     else:
@@ -645,7 +664,7 @@ if run_button:
                 st.caption(f"Model: {model_desc} | Calibration: 2-year historical data | Paths: 5,000")
 
                 # ----------------------------
-                # 🔍 Bayesian Signal Analysis (Experimental) - теперь как отдельный функционал
+                # 🔍 Bayesian Signal Analysis (Experimental)
                 # ----------------------------
                 bayes_result = bayesian_signal_analysis(ticker_input, current_price, future_prices, fetch_stock_data)
                 if bayes_result is not None:
@@ -941,5 +960,6 @@ if run_button:
                     file_name=f"{ticker_input}_forecast_{forecast_days}d.csv",
                     mime="text/csv"
                 )
+
 else:
     st.info("👆 Adjust parameters and click **'Run Forecast'** to start.")
